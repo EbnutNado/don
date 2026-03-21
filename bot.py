@@ -312,7 +312,7 @@ async def process_action(user_id, action, user_data):
 
 # ---------- Запуск ----------
 def main():
-    TOKEN = "YOUR_BOT_TOKEN_HERE"
+    TOKEN = "8619745303:AAHsEWaPKdPSbenRO7dzVCrDvxUIm0CzDu0"
     app = Application.builder().token(TOKEN).build()
 
     conv_handler = ConversationHandler(
