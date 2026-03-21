@@ -16,14 +16,12 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
 # Состояния разговора
 SELECT_SIDE, CHRONOLOGY_VIEW, GAME_MAIN, COMBAT, LOCATION_MENU, ACTION_INPUT = range(6)
 
-# Инициализация БД
 db.init_db()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
     player = db.load_player(user_id)
     if player:
-        # Если уже есть сохранённая игра, предложим продолжить
         await update.message.reply_text(
             "🔄 У вас есть сохранённая игра. Продолжить или начать новую?",
             reply_markup=InlineKeyboardMarkup([
@@ -33,7 +31,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
         return SELECT_SIDE
     else:
-        # Новая игра: показываем хронологию или сразу выбор стороны
         await update.message.reply_text(
             "📖 *Донбасс 2014 – интерактивная хроника*\n\n"
             "Это игра, основанная на реальных событиях.\n"
@@ -53,7 +50,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     data = query.data
     user_id = query.from_user.id
 
-    # Обработка продолжения / новой игры
     if data == "continue":
         player = db.load_player(user_id)
         if player:
@@ -71,7 +67,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await start(update, context)
         return SELECT_SIDE
 
-    # Хронология
     if data == "chronology":
         idx = 0
         await query.edit_message_text(
@@ -92,7 +87,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             context.user_data["chrono_idx"] = idx + 1
         else:
-            # Хронология закончена – предлагаем выбрать сторону
             await query.edit_message_text(
                 "Хронология завершена. Теперь выберите сторону:",
                 reply_markup=InlineKeyboardMarkup([
@@ -103,7 +97,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             return SELECT_SIDE
 
-    # Выбор стороны
     if data == "choose_side":
         await query.edit_message_text(
             "Выберите сторону:",
@@ -120,7 +113,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if side not in SIDES:
             await query.edit_message_text("Ошибка: неверная сторона.")
             return SELECT_SIDE
-        # Инициализация нового игрока
         player = {
             "user_id": user_id,
             "side": side,
@@ -141,7 +133,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await show_main_menu(query.message, player)
         return GAME_MAIN
 
-    # Основное меню
     if data == "main_menu":
         player = context.user_data["player"]
         await show_main_menu(query.message, player)
@@ -160,6 +151,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return LOCATION_MENU
         loc = LOCATIONS[loc_key]
         context.user_data["current_location"] = loc_key
+        # случайное событие при входе
+        event_desc, delta, resource = random_event()
+        if delta != 0:
+            player = context.user_data["player"]
+            if resource == "health":
+                player["health"] = max(0, min(100, player["health"] + delta))
+            elif resource == "food":
+                player["resources"]["food"] = max(0, player["resources"]["food"] + delta)
+            elif resource == "ammo":
+                player["resources"]["ammo"] = max(0, player["resources"]["ammo"] + delta)
+            elif resource == "morale":
+                player["morale"] = max(0, min(100, player["morale"] + delta))
+            db.save_player(player["user_id"], player)
+            await query.message.reply_text(f"{event_desc}: {'+' if delta>0 else ''}{delta}")
         await query.edit_message_text(
             f"📍 *{loc['name']}*\n\n{loc['description']}",
             parse_mode="Markdown",
@@ -182,15 +187,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return LOCATION_MENU
 
-    # Обработка действий
     if data.startswith("do_"):
         _, loc_key, action_id = data.split("_")
         player = context.user_data["player"]
         result = await process_action(user_id, loc_key, action_id, player, context)
         if result.get("combat"):
-            # Переход в бой
             enemy_key = result["enemy_key"]
-            context.user_data["combat_data"] = {"enemy_key": enemy_key, "loc_key": loc_key}
+            context.user_data["combat_data"] = {
+                "enemy_key": enemy_key,
+                "loc_key": loc_key,
+                "enemy_health": ENEMIES[enemy_key]["health"]
+            }
             await query.edit_message_text(
                 f"⚔️ *ВСТУПЛЕНИЕ В БОЙ*\nПротивник: {ENEMIES[enemy_key]['name']}\nЗдоровье: {ENEMIES[enemy_key]['health']}\n\n{result['text']}",
                 parse_mode="Markdown",
@@ -202,13 +209,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             return COMBAT
         else:
-            # Обычный исход
             await query.edit_message_text(result["text"], parse_mode="Markdown")
-            # Возвращаем в меню локации
             await show_location_actions(query.message, loc_key, player)
             return LOCATION_MENU
 
-    # Боевые действия
     if data == "combat_attack":
         combat_data = context.user_data.get("combat_data")
         if not combat_data:
@@ -219,43 +223,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         enemy_key = combat_data["enemy_key"]
         enemy = ENEMIES[enemy_key]
         weapon = player["resources"].get("weapon", "pistol")
-
-        # Проверка боеприпасов для РПГ
-        if weapon == "rpg" and player["resources"].get("ammo", 0) < 1:
-            await query.edit_message_text("❌ Нет боеприпасов для РПГ! Используйте другое оружие.")
-            # Можно вернуться к боевому меню
-            return COMBAT
-
-        # Бой
-        # Здесь нужно вести временное здоровье врага, сохраняя его в context
-        enemy_health = context.user_data.get("enemy_health", enemy["health"])
+        enemy_health = context.user_data["combat_data"]["enemy_health"]
         player_health = player["health"]
         player_ammo = player["resources"]["ammo"]
 
-        # Выстрел
-        if weapon == "rpg":
-            # Используем один боеприпас
-            if player_ammo >= 1:
-                player_ammo -= 1
-                # Урон по врагу
-                dmg = random.randint(WEAPONS["rpg"]["damage_min"], WEAPONS["rpg"]["damage_max"])
-                enemy_health -= dmg
-                log = [f"🚀 Вы выпустили РПГ! Урон {dmg}."]
-            else:
-                log = ["❌ Нет боеприпасов!"]
-        else:
-            # Стандартная атака
-            new_player_health, new_enemy_health, new_ammo, log, win = combat(weapon, enemy_key, player_health, enemy_health, player_ammo)
-            player_health = new_player_health
-            enemy_health = new_enemy_health
-            player_ammo = new_ammo
+        # Бой
+        new_player_health, new_enemy_health, new_ammo, log, win = combat(weapon, enemy_key, player_health, enemy_health, player_ammo)
 
-        # Обновляем временные данные
-        context.user_data["enemy_health"] = enemy_health
-        player["health"] = player_health
-        player["resources"]["ammo"] = player_ammo
+        player["health"] = new_player_health
+        player["resources"]["ammo"] = new_ammo
+        context.user_data["combat_data"]["enemy_health"] = new_enemy_health
+        db.save_player(player["user_id"], player)
 
-        if enemy_health <= 0:
+        if win is True:
             # Победа
             reward = enemy["reward"]
             player["resources"]["food"] += reward["food"]
@@ -265,11 +245,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             log.append(f"✅ Победа! Вы получили: {reward['food']} еды, {reward['ammo']} патронов, {reward['score']} очков.")
             db.save_player(player["user_id"], player)
             await query.edit_message_text("\n".join(log), parse_mode="Markdown")
-            # Возврат к локации
             await show_location_actions(query.message, combat_data["loc_key"], player)
             del context.user_data["combat_data"]
             return LOCATION_MENU
-        elif player_health <= 0:
+        elif win is False:
             # Поражение
             log.append("💀 Вы погибли... Игра окончена.")
             await query.edit_message_text("\n".join(log), parse_mode="Markdown")
@@ -330,7 +309,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             enemy_key = combat_data["enemy_key"]
             enemy = ENEMIES[enemy_key]
             player = context.user_data["player"]
-            enemy_health = context.user_data.get("enemy_health", enemy["health"])
+            enemy_health = combat_data.get("enemy_health", enemy["health"])
             enemy_dmg = random.randint(max(1, enemy["damage"]-5), enemy["damage"]+5)
             player["health"] -= enemy_dmg
             if player["health"] <= 0:
@@ -408,55 +387,205 @@ async def show_location_actions(message, loc_key, player):
     )
 
 async def process_action(user_id, loc_key, action_id, player, context):
-    # Логика действий
+    """Обрабатывает любое действие из локации, возвращает словарь с результатом."""
+    side = player["side"]
+    res = player["resources"]
+    health = player["health"]
+    morale = player["morale"]
+    score = player["score"]
+
+    def save_and_return(text, combat=False, enemy_key=None):
+        db.save_player(user_id, player)
+        if combat:
+            return {"combat": True, "enemy_key": enemy_key, "text": text}
+        return {"text": text}
+
+    # ---------- ДОНЕЦК ----------
     if action_id == "patrol":
-        # Случайная встреча
         if random.random() < 0.4:
-            enemy = random.choice(list(ENEMIES.keys()))
-            return {"combat": True, "enemy_key": enemy, "text": "🔍 Во время патрулирования вы столкнулись с противником!"}
+            possible = ["patrol", "sniper", "militant"] if side == "militia" else ["patrol", "sniper", "soldier"]
+            enemy = random.choice(possible)
+            return save_and_return("🔍 Во время патрулирования вы столкнулись с противником!", combat=True, enemy_key=enemy)
         else:
-            # Находка
-            ammo_gain = random.randint(5, 20)
-            player["resources"]["ammo"] += ammo_gain
-            db.save_player(user_id, player)
-            return {"text": f"✅ Патрулирование прошло успешно. Найдено {ammo_gain} патронов."}
+            gain_ammo = random.randint(5, 20)
+            res["ammo"] += gain_ammo
+            return save_and_return(f"✅ Патрулирование прошло успешно. Найдено {gain_ammo} патронов.")
+
     elif action_id == "assault_sbu":
-        return {"combat": True, "enemy_key": "sbu_defender", "text": "⚔️ Начинается штурм здания СБУ! Будьте осторожны."}
+        return save_and_return("⚔️ Начинается штурм здания СБУ!", combat=True, enemy_key="sbu_defender")
+
     elif action_id == "help_civilians":
-        # Повышение морали, трата еды
-        if player["resources"]["food"] >= 5:
-            player["resources"]["food"] -= 5
+        if res["food"] >= 5:
+            res["food"] -= 5
             player["morale"] = min(100, player["morale"] + 15)
             player["score"] += 10
-            db.save_player(user_id, player)
-            return {"text": "🤝 Вы помогли мирным жителям. Мораль повышена, получено +10 очков."}
+            return save_and_return("🤝 Вы помогли мирным жителям. Мораль повышена, +10 очков.")
         else:
-            return {"text": "❌ У вас недостаточно еды для помощи."}
+            return save_and_return("❌ У вас недостаточно еды для помощи.")
+
     elif action_id == "scavenge":
-        # Риск обстрела
         if random.random() < 0.3:
             dmg = random.randint(10, 30)
             player["health"] -= dmg
-            db.save_player(user_id, player)
-            return {"text": f"💥 Во время поисков вы попали под обстрел! Потеряно {dmg} здоровья."}
+            return save_and_return(f"💥 Во время поисков вы попали под обстрел! Потеряно {dmg} здоровья.")
         else:
-            food_gain = random.randint(5, 20)
-            ammo_gain = random.randint(10, 30)
-            player["resources"]["food"] += food_gain
-            player["resources"]["ammo"] += ammo_gain
-            db.save_player(user_id, player)
-            return {"text": f"🔍 Вы нашли {food_gain} еды и {ammo_gain} патронов."}
-    # Добавьте другие действия аналогично
+            gain_food = random.randint(5, 20)
+            gain_ammo = random.randint(10, 30)
+            res["food"] += gain_food
+            res["ammo"] += gain_ammo
+            return save_and_return(f"🔍 Вы нашли {gain_food} еды и {gain_ammo} патронов.")
+
+    # ---------- ЛУГАНСК ----------
+    elif action_id == "investigate_bombing":
+        player["score"] += 20
+        player["morale"] = min(100, player["morale"] + 5)
+        return save_and_return("💣 Вы нашли свидетельства авиаудара. Истина раскрыта. +20 очков, +5 морали.")
+
+    elif action_id == "evacuate":
+        if res["food"] >= 10:
+            res["food"] -= 10
+            player["score"] += 30
+            player["morale"] = min(100, player["morale"] + 20)
+            return save_and_return("🚐 Вы организовали эвакуацию. Жители спасены. +30 очков.")
+        else:
+            return save_and_return("❌ Недостаточно еды для организации эвакуации.")
+
+    elif action_id == "defend":
+        return save_and_return("🛡️ Диверсанты атакуют блокпост!", combat=True, enemy_key="saboteur")
+
+    elif action_id == "humanitarian":
+        if res["food"] >= 8:
+            res["food"] -= 8
+            player["score"] += 15
+            player["morale"] = min(100, player["morale"] + 10)
+            return save_and_return("📦 Вы раздали гуманитарную помощь. Мораль повышена, +15 очков.")
+        else:
+            return save_and_return("❌ Недостаточно еды для раздачи.")
+
+    # ---------- СЛАВЯНСК ----------
+    elif action_id == "supply_run":
+        return save_and_return("📦 Прорыв блокпостов! Встречайте врага.", combat=True, enemy_key="patrol")
+
+    elif action_id == "breakthrough":
+        return save_and_return("💥 Попытка прорыва окружения! На вас идёт усиленный отряд.", combat=True, enemy_key="btr")
+
+    elif action_id == "sniper_duel":
+        if random.random() < 0.5:
+            res["ammo"] += 5
+            player["score"] += 25
+            return save_and_return("🎯 Вы победили снайпера! +25 очков, трофейные патроны.")
+        else:
+            dmg = random.randint(20, 40)
+            player["health"] -= dmg
+            return save_and_return(f"💔 Снайпер вас ранил! -{dmg} здоровья.")
+
+    elif action_id == "minefield":
+        if random.random() < 0.7:
+            player["score"] += 40
+            player["morale"] = min(100, player["morale"] + 15)
+            return save_and_return("⚠️ Вы успешно разминировали участок! +40 очков.")
+        else:
+            dmg = random.randint(30, 70)
+            player["health"] -= dmg
+            if player["health"] <= 0:
+                return save_and_return("💀 Мина взорвалась... Вы погибли.")
+            return save_and_return(f"💥 Мина сработала! -{dmg} здоровья.")
+
+    # ---------- АЭРОПОРТ ----------
+    elif action_id == "defend_terminal":
+        if side == "ukraine":
+            return save_and_return("🛡️ Оборона терминала! Бой с ополчением.", combat=True, enemy_key="militant")
+        else:
+            return save_and_return("❌ Вы не можете защищать терминал за эту сторону.")
+
+    elif action_id == "storm_terminal":
+        if side == "militia":
+            return save_and_return("⚔️ Штурм терминала! Бой с украинскими защитниками.", combat=True, enemy_key="soldier")
+        else:
+            return save_and_return("❌ Вы не можете штурмовать терминал за эту сторону.")
+
+    elif action_id == "evacuate_wounded":
+        if res["medkits"] >= 2:
+            res["medkits"] -= 2
+            player["score"] += 30
+            player["morale"] = min(100, player["morale"] + 20)
+            return save_and_return("🚑 Вы вывезли раненых. +30 очков.")
+        else:
+            return save_and_return("❌ Нет аптечек для эвакуации.")
+
+    elif action_id == "tunnel_fight":
+        return save_and_return("🚇 Бой в подземельях! Ближний бой с врагом.", combat=True, enemy_key="saboteur")
+
+    # ---------- ИЛОВАЙСК ----------
+    elif action_id == "encirclement":
+        return save_and_return("💀 Вы в котле! Попытка прорыва.", combat=True, enemy_key="tank")
+
+    elif action_id == "negotiate":
+        if player["morale"] > 50 and random.random() < 0.6:
+            player["score"] += 50
+            return save_and_return("🤝 Переговоры успешны, открыт коридор. +50 очков.")
+        else:
+            return save_and_return("💔 Переговоры провалились, вас атакуют!", combat=True, enemy_key="patrol")
+
+    elif action_id == "hold_line":
+        return save_and_return("⚔️ Удерживайте позиции любой ценой!", combat=True, enemy_key="btr")
+
+    # ---------- БАЗА ----------
+    elif action_id == "rest":
+        heal = random.randint(15, 40)
+        player["health"] = min(100, player["health"] + heal)
+        if res["food"] >= 3:
+            res["food"] -= 3
+        return save_and_return(f"🛌 Вы отдохнули и восстановили {heal} здоровья. Потрачено 3 еды.")
+
+    elif action_id == "train":
+        if res["food"] >= 4:
+            res["food"] -= 4
+            player["morale"] = min(100, player["morale"] + 10)
+            return save_and_return("🏋️ Тренировка повысила мораль на 10. Потрачено 4 еды.")
+        else:
+            return save_and_return("❌ Недостаточно еды для тренировки.")
+
+    elif action_id == "trade":
+        if res["ammo"] >= 10:
+            res["ammo"] -= 10
+            res["food"] += 5
+            return save_and_return("🔄 Обмен: -10 патронов, +5 еды.")
+        else:
+            return save_and_return("❌ Недостаточно патронов для обмена (нужно 10).")
+
+    elif action_id == "quest":
+        quests = [
+            {"text": "Доставьте медикаменты в госпиталь", "reward_score": 20, "req_medkits": 2},
+            {"text": "Патрулируйте опасный район", "reward_score": 15, "req_ammo": 10},
+            {"text": "Помогите мирным жителям", "reward_score": 25, "req_food": 8},
+        ]
+        q = random.choice(quests)
+        if "req_medkits" in q and res["medkits"] >= q["req_medkits"]:
+            res["medkits"] -= q["req_medkits"]
+            player["score"] += q["reward_score"]
+            return save_and_return(f"📜 {q['text']} выполнено! +{q['reward_score']} очков.")
+        elif "req_ammo" in q and res["ammo"] >= q["req_ammo"]:
+            res["ammo"] -= q["req_ammo"]
+            player["score"] += q["reward_score"]
+            return save_and_return(f"📜 {q['text']} выполнено! +{q['reward_score']} очков.")
+        elif "req_food" in q and res["food"] >= q["req_food"]:
+            res["food"] -= q["req_food"]
+            player["score"] += q["reward_score"]
+            return save_and_return(f"📜 {q['text']} выполнено! +{q['reward_score']} очков.")
+        else:
+            return save_and_return("❌ У вас не хватает ресурсов для выполнения текущего квеста. Попробуйте позже.")
+
     else:
-        # Заглушка
-        return {"text": "🚧 Это действие пока в разработке."}
+        # На случай, если добавится новое действие без обработки
+        return save_and_return("🚧 Это действие временно недоступно.")
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("Игра прервана. /start для начала.")
     return ConversationHandler.END
 
 def main():
-    TOKEN = "8619745303:AAHsEWaPKdPSbenRO7dzVCrDvxUIm0CzDu0"
+    TOKEN = "8619745303:AAHsEWaPKdPSbenRO7dzVCrDvxUIm0CzDu0"  # Замените на свой токен
     app = Application.builder().token(TOKEN).build()
 
     conv_handler = ConversationHandler(
