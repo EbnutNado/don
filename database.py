@@ -43,8 +43,8 @@ def save_player(user_id, data):
             data['morale'],
             json.dumps(data['resources']),
             data['location'],
-            json.dumps(data['completed_events']),
-            data['score'],
+            json.dumps(data.get('completed_events', [])),
+            data.get('score', 0),
             json.dumps(data.get('achievements', []))
         ))
         conn.commit()
