@@ -28,10 +28,10 @@ import aiosqlite
 
 # ==================== КОНФИГУРАЦИЯ ====================
 # Токен лучше задать в переменной окружения BOT_TOKEN (не хранить в коде в продакшене).
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8451168327:AAGQffadqqBg3pZNQnjctVxH-dUgXsovTr4")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8619745303:AAHsEWaPKdPSbenRO7dzVCrDvxUIm0CzDu0")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "5775839902"))
 # Канал для «Криминальной хроники»: ID вида -100xxxxxxxxxx; бот должен быть админом канала.
-CHRONICLE_CHANNEL_ID = os.getenv("CHRONICLE_CHANNEL_ID")
+CHRONICLE_CHANNEL_ID = os.getenv("-1003008379294")
 CHRONICLE_CHANNEL_ID = int(CHRONICLE_CHANNEL_ID) if CHRONICLE_CHANNEL_ID else None
 # Слоты: после ставки игрок отправляет этот эмодзи (можно сменить).
 SLOT_SPIN_EMOJI = os.getenv("SLOT_SPIN_EMOJI", "🎰")
@@ -1954,7 +1954,7 @@ async def cmd_start(message: Message):
     tolerance = await get_nagirt_tolerance(user_id)
     welcome_text = (
         f"👋 Добро пожаловать на работу, {full_name}!\n\n"
-        f"Я *Виталик* — ваш генеральный директор! 👔\n\n"
+        f"Я *Виталик* - ваш генеральный директор! 👔\n\n"
         f"💰 *Начальный капитал:* {format_money(user['balance'] if user else ECONOMY_SETTINGS['start_balance'])}\n"
         f"💼 *Зарплата:* каждые 5 минут\n"
         f"⚡ *Случайные проверки:* каждые 20-30 минут\n\n"
@@ -1965,8 +1965,8 @@ async def cmd_start(message: Message):
     welcome_text += (
         f"📊 *Доступные функции:*\n"
         f"• 💰 Получка ({format_money(ECONOMY_SETTINGS['salary_min'])}-{format_money(ECONOMY_SETTINGS['salary_max'])})\n"
-        f"• 🛒 Магазин (реалистичные цены)\n"
-        f"• 🏦 Банк «Асфальт-Капитал» — кредит под проценты\n"
+        f"• 🛒 Магазин (Antonov-Shop)\n"
+        f"• 🏦 Банк «Асфальт-Капитал» - кредит под проценты\n"
         f"• 🔁 Переводы между сотрудниками\n"
         f"• 🎮 Мини-игры (рулетка, асфальт, ДУЭЛЬ)\n"
         f"• 💊 Таблетки Нагирт (риск/награда)\n"
@@ -1991,7 +1991,7 @@ async def handle_check_activation(message: Message, check_id: str):
         tolerance = await get_nagirt_tolerance(user_id)
         welcome_text = (
             f"👋 Добро пожаловать на работу, {full_name}!\n\n"
-            f"Я *Виталик* — ваш генеральный директор! 👔\n\n"
+            f"Я *Виталик* - ваш генеральный директор! 👔\n\n"
             f"💰 *Начальный капитал:* {format_money(user['balance'] if user else ECONOMY_SETTINGS['start_balance'])}\n"
             f"💼 *Зарплата:* каждые 5 минут\n"
             f"⚡ *Случайные проверки:* каждые 20-30 минут\n\n"
@@ -2002,7 +2002,7 @@ async def handle_check_activation(message: Message, check_id: str):
         welcome_text += (
             f"📊 *Доступные функции:*\n"
             f"• 💰 Получка ({format_money(ECONOMY_SETTINGS['salary_min'])}-{format_money(ECONOMY_SETTINGS['salary_max'])})\n"
-            f"• 🛒 Магазин (реалистичные цены)\n"
+            f"• 🛒 Магазин (Antonov-Shop)\n"
             f"• 🔁 Переводы между сотрудниками\n"
             f"• 🎮 Мини-игры (рулетка, асфальт, ДУЭЛЬ)\n"
             f"• 💊 Таблетки Нагирт (риск/награда)\n"
@@ -2162,7 +2162,7 @@ async def handle_shop(message: Message):
     active_boosts = await get_active_boosts(user_id)
     nagirt_effects = await get_active_nagirt_effects(user_id)
     shop_text = (
-        "🏪 *Корпоративный магазин Виталика*\n\n"
+        "🏪 *Корпоративный магазин Antonov-Shop*\n\n"
         f"💰 *Ваш баланс:* {format_money(user['balance'])}\n\n"
     )
     if active_boosts > 0:
