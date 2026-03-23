@@ -33,11 +33,9 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "5775839902"))
 # Telegram username бота для генерации ссылок вида https://t.me/<bot_username>?start=...
 # Если не задан — будет использован bot.get_me().username.
 # Формат допустим любой: "my_bot" или "@my_bot".
-BOT_USERNAME_MANUAL = ""  # впишите сюда "my_bot" (или "@my_bot"), если хотите задавать username прямо в коде
-BOT_USERNAME = (os.getenv("BOT_USERNAME", "terekonik22_bot").strip().lstrip("@") or BOT_USERNAME_MANUAL.strip().lstrip("@"))
-# Коррекции username по умолчанию выключены.
-# Раньше был хардкод под конкретный username; если он вам нужен, включите:
-# ENABLE_USERNAME_CORRECTIONS=1
+BOT_USERNAME_MANUAL = "terekonik22_bot"  # впишите сюда "my_bot" (или "@my_bot"), если хотите задавать username прямо в коде
+BOT_USERNAME = (os.getenv("BOT_USERNAME", "").strip().lstrip("@") or BOT_USERNAME_MANUAL.strip().lstrip("@"))
+# Коррекции username по умолчанию включены (на случай несовпадения "username" и отображаемого t.me).
 ENABLE_USERNAME_CORRECTIONS = os.getenv("ENABLE_USERNAME_CORRECTIONS", "1").strip().lower() in ("1", "true", "yes", "on")
 # Хроника: задай CHRONICLE_CHANNEL_ID=-100... (число) ИЛИ CHRONICLE_CHANNEL_USERNAME=mychannel (без @).
 # Бот должен быть администратором канала с правом публикации.
@@ -2666,10 +2664,16 @@ async def cmd_start(message: Message):
         return
     if len(args) > 1:
         payload = args[1].strip()
-        if payload.lower().startswith("ref_"):
+        tmp = payload.lower()
+        # Поддерживаем оба формата: `ref_<id>` и (иногда из-за форматирования) `ref<id>`.
+        if tmp.startswith("ref"):
+            suffix = payload[3:]
+            if suffix.startswith("_"):
+                suffix = suffix[1:]
             try:
-                referrer_id = int(payload[4:])
+                referrer_id = int(suffix)
             except ValueError:
+                # Если не получилось разобрать число — дальше пробуем трактовать как check_id.
                 referrer_id = None
         else:
             check_id = payload.upper()
@@ -2684,6 +2688,8 @@ async def cmd_start(message: Message):
             if check_exists:
                 await handle_check_activation(message, check_id)
                 return
+        # Если это `ref...` и referrer_id разобрался — дальше регистрируем пользователя.
+        # Если referrer_id не разобрался — продолжаем, как будто параметр не относится к рефералке.
     user_id = message.from_user.id
     username = message.from_user.username or "Без username"
     full_name = message.from_user.full_name
@@ -5784,7 +5790,8 @@ async def handle_referrals_menu(message: Message):
     lines = [
         "👥 *РЕФЕРАЛЬНАЯ СИСТЕМА*",
         "",
-        f"Ссылка: https://t.me/{bot_username}?start=ref_{user_id}",
+        # Backticks нужны, чтобы Markdown не "съел" подчёркивание в `ref_<id>`.
+        f"Ссылка: `https://t.me/{bot_username}?start=ref_{user_id}`",
         f"Приглашено (активных): {invited}",
         f"Заработано: {format_money(earned)}",
         "",
