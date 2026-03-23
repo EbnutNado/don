@@ -38,7 +38,7 @@ BOT_USERNAME = (os.getenv("BOT_USERNAME", "terekonik22_bot").strip().lstrip("@")
 # Коррекции username по умолчанию выключены.
 # Раньше был хардкод под конкретный username; если он вам нужен, включите:
 # ENABLE_USERNAME_CORRECTIONS=1
-ENABLE_USERNAME_CORRECTIONS = os.getenv("ENABLE_USERNAME_CORRECTIONS", "").strip().lower() in ("1", "true", "yes", "on")
+ENABLE_USERNAME_CORRECTIONS = os.getenv("ENABLE_USERNAME_CORRECTIONS", "1").strip().lower() in ("1", "true", "yes", "on")
 # Хроника: задай CHRONICLE_CHANNEL_ID=-100... (число) ИЛИ CHRONICLE_CHANNEL_USERNAME=mychannel (без @).
 # Бот должен быть администратором канала с правом публикации.
 def _load_chronicle_config() -> tuple:
