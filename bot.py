@@ -6241,19 +6241,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
-# ==================== КОНФИГУРАЦИЯ ====================
-# Токен лучше задать в переменной окружения BOT_TOKEN (не хранить в коде в продакшене).
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8619745303:AAHsEWaPKdPSbenRO7dzVCrDvxUIm0CzDu0")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "5775839902"))
-# Хроника: задай CHRONICLE_CHANNEL_ID=-100... (число) ИЛИ CHRONICLE_CHANNEL_USERNAME=mychannel (без @).
-# Бот должен быть администратором канала с правом публикации.
-def _load_chronicle_config() -> tuple:
-    raw_id = os.getenv("CHRONICLE_CHANNEL_ID", "-1003008379294").strip()
-    raw_user = os.getenv("CHRONICLE_CHANNEL_USERNAME", "kamensk_avtodor_prorab").strip().lstrip("@")
-    cid: Optional[int] = None
-   
-    raw_id = os.getenv("SUBSCRIBE_CHANNEL_ID", "-1003008379294").strip()
-    raw_user = os.getenv("SUBSCRIBE_CHANNEL_USERNAME", "kamensk_avtodor_prorab").strip().lstrip("@")
