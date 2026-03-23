@@ -55,6 +55,9 @@ MSK = ZoneInfo("Europe/Moscow")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Чтобы публикации в TG-канал шли в корректной хронологии (без “перемешивания” из-за параллельных задач).
+chronicle_send_lock = asyncio.Lock()
+
 # Подсказка без слэш-команд: регистрация только через кнопку Start у Telegram
 NOT_REGISTERED_HINT = (
     "Сначала зарегистрируйся: нажми «Start» / «Запустить» под строкой ввода внизу экрана."
@@ -79,7 +82,7 @@ ECONOMY_SETTINGS = {
     "fine_chance": 0.40,
     "random_fine_min": 450,
     "random_fine_max": 3200,
-    "asphalt_earnings": 150,
+    "asphalt_earnings": 45,
     "asphalt_fine_min": 180,
     "asphalt_fine_max": 750,
     # Кости: чёт / нечёт (кубик 1–6, угадал → ×2)
@@ -98,6 +101,19 @@ ECONOMY_SETTINGS = {
     "inventory_base_slots": 20,
 }
 
+# ==================== МЕХАНИКИ БИЗНЕСОВ ====================
+# Цены на покупку бизнесов снизить примерно в 1.5 раза.
+BUSINESS_PRICE_DIVISOR: float = 1.5
+
+# ==================== СОЦИАЛЬНЫЕ / РЕФЕРАЛЬНЫЕ СИСТЕМЫ ====================
+REFERRAL_ACTIONS_MIN: int = 5  # "активный новичок"
+REFERRAL_DELAY_HOURS: int = 24  # начисление через 24ч после регистрации
+
+# ==================== УВЕДОМЛЕНИЯ О "БЕДНОСТИ" ====================
+# Если баланс упал ниже порога (и при этом был выше до операции) — отправляем событие в хроннику.
+POOR_BALANCE_THRESHOLD: int = 2000
+POOR_ALERT_COOLDOWN_SEC: int = 6 * 3600  # защита от спама (раз в 6 часов максимум)
+
 # Типы начислений, которые идут в «заработок за день» (МСК)
 DAILY_EARN_TXN_TYPES = frozenset({
     "salary", "business_income", "asphalt", "dice_even_win", "duel_win",
@@ -108,18 +124,21 @@ DAILY_EARN_TXN_TYPES = frozenset({
 BANK_SETTINGS = {
     "name": "Асфальт-Капитал",
     "min_loan": 2_000,
-    "max_loan": 120_000,
-    "hourly_interest_rate": 0.005,  # 0.5% в час от тела долга (начисляется периодически)
+    "max_loan": 200_000,
+    "hourly_interest_rate": 0.004,  # 0.4% в час
     "term_hours": 48,  # после срока — режим коллекторов
-    "accrual_interval_sec": 900,  # проверка начислений каждые 15 мин
-    "collector_interval_sec": 1_200,  # визит коллекторов раз в 20 мин при просрочке
-    "collector_seize_balance_pct": 15,  # % баланса за визит
-    "collector_min_seize": 300,
+    # За начислениями следим раз в час.
+    "accrual_interval_sec": 3600,
+    "collector_interval_sec": 3600,  # коллекторы "в час"
+    # Коллекторы списывают 10-20% баланса за визит.
+    "collector_seize_balance_min_pct": 0.10,
+    "collector_seize_balance_max_pct": 0.20,
+    "collector_min_seize": 1,
     "salary_garnish_if_defaulted": 0.25,  # с получки удерживается в погашение долга
-    # Пул ликвидности: кредиты только из кассы; стартовая подушка (можно 0 — тогда только депозиты)
-    "initial_pool_liquidity": int(os.getenv("BANK_INITIAL_POOL", "500000")),
-    "min_deposit": 1_000,
-    "deposit_hourly_rate": 0.0002,  # %% в час на сумму вклада, выплата из пула
+    # Казна всегда полна (логически). Начальный "пул" оставляем под 10 000 000.
+    "initial_pool_liquidity": int(os.getenv("BANK_INITIAL_POOL", "10000000")),
+    "min_deposit": 5_000,
+    "deposit_hourly_rate": 0.002,  # 0.2% в час
     "deposit_interest_interval_sec": 3600,
 }
 
@@ -585,6 +604,7 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS bank_deposits (
                 user_id INTEGER PRIMARY KEY,
                 amount INTEGER NOT NULL DEFAULT 0,
+                total_interest INTEGER NOT NULL DEFAULT 0,
                 last_interest_at TEXT,
                 FOREIGN KEY (user_id) REFERENCES players(user_id)
             )
@@ -597,6 +617,8 @@ async def init_db():
             "ALTER TABLE players ADD COLUMN nagirt_uses INTEGER DEFAULT 0",
             "ALTER TABLE players ADD COLUMN rep_points INTEGER DEFAULT 0",
             "ALTER TABLE players ADD COLUMN rep_votes INTEGER DEFAULT 0",
+            "ALTER TABLE bank_deposits ADD COLUMN total_interest INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE players ADD COLUMN poor_alerted_at TIMESTAMP",
         ):
             try:
                 await db.execute(alter)
@@ -604,6 +626,23 @@ async def init_db():
                 pass
         await db.commit()
         logger.info("✅ База данных инициализирована (бизнесы, банк, инвентарь, топ дня, ачивки)")
+
+        # ==================== РЕФЕРАЛЬНАЯ СИСТЕМА ====================
+        # Начисление бонусов происходит через 24 часа после регистрации,
+        # и только если новичок активен (минимум REFERRAL_ACTIONS_MIN действий).
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS referral_invites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                inviter_id INTEGER NOT NULL,
+                invitee_id INTEGER NOT NULL UNIQUE,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                credited_at TIMESTAMP,
+                milestone INTEGER DEFAULT 0,
+                reward_inviter INTEGER NOT NULL DEFAULT 0,
+                reward_newcomer INTEGER NOT NULL DEFAULT 0
+            )
+        ''')
+        await db.commit()
 
 
 def moscow_date_str(when: Optional[datetime] = None) -> str:
@@ -651,6 +690,29 @@ async def adjust_global_economy(
     return await get_global_economy()
 
 
+async def set_global_economy_param(param: str, value: float) -> Dict[str, float]:
+    """Абсолютное (set) изменение параметров global_economy через ввод чисел в админке."""
+    if param == "fine_scale":
+        clamped = max(0.3, min(3.0, float(value)))
+        col = "fine_scale"
+    elif param == "transfer_commission_pct":
+        clamped = max(0.0, min(0.25, float(value)))
+        col = "transfer_commission_pct"
+    elif param == "business_tax_chance":
+        clamped = max(0.05, min(0.55, float(value)))
+        col = "business_tax_chance"
+    elif param == "business_tax_take_pct":
+        clamped = max(0.1, min(0.7, float(value)))
+        col = "business_tax_take_pct"
+    else:
+        return await get_global_economy()
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(f"UPDATE global_economy SET {col} = ? WHERE id = 1", (clamped,))
+        await db.commit()
+    return await get_global_economy()
+
+
 async def post_chronicle(text: str) -> None:
     """Публикация в канал без Markdown (имена игроков часто ломают разметку)."""
     global _chronicle_resolved_id
@@ -675,7 +737,8 @@ async def post_chronicle(text: str) -> None:
         return
     body = "📰 Криминальная хроника\n\n" + text
     try:
-        await bot.send_message(chat_id, body, disable_web_page_preview=True)
+        async with chronicle_send_lock:
+            await bot.send_message(chat_id, body, disable_web_page_preview=True)
     except Exception as e:
         logger.error(
             "Хроника: send_message(chat_id=%s) не удался. Проверь, что бот админ канала с правом постинга. %s",
@@ -748,6 +811,123 @@ async def get_player_modifiers(user_id: int) -> Dict[str, Any]:
         mods["transfer_extra_fee"] += ACHIEVEMENTS["kidala"].get("transfer_extra_fee", 0)
         mods["titles"].append(ACHIEVEMENTS["kidala"].get("title", ACHIEVEMENTS["kidala"]["name"]))
     return mods
+
+
+# ==================== СОЦИАЛЬНЫЕ СТАТУСЫ ====================
+_legend_cache_month: Optional[str] = None
+_legend_top3_ids: set[int] = set()
+
+
+async def get_legend_top3_ids_for_month() -> set[int]:
+    """Легенда: топ-3 по балансу за месяц (упрощённо: топ-3 по балансу, пересчёт раз в месяц)."""
+    global _legend_cache_month, _legend_top3_ids
+    month_key = datetime.now(MSK).strftime("%Y-%m")
+    if _legend_cache_month == month_key and _legend_top3_ids:
+        return _legend_top3_ids
+    async with aiosqlite.connect(DB_NAME) as db:
+        cur = await db.execute(
+            "SELECT user_id FROM players ORDER BY balance DESC LIMIT 3"
+        )
+        rows = await cur.fetchall()
+    _legend_top3_ids = {int(r[0]) for r in rows}
+    _legend_cache_month = month_key
+    return _legend_top3_ids
+
+
+async def get_social_status_for_user(user_id: int) -> Dict[str, Any]:
+    """
+    Статусы:
+    🟢 Новичок
+    🔵 Стажёр — 10 получок + 1 бизнес (комиссия переводов -13%)
+    🟡 Мастер — 50 побед в дуэлях + 5 бизнесов (скидка в магазине -3%)
+    🟠 Мафиози — 100 побед + 10 бизнесов + 1 млн ₽ (скидка -5%, кредитный лимит +50%)
+    🔴 Легенда — топ-3 по балансу за месяц (скидка -10%, комиссия переводов 0%)
+    🟣 Агитатор — 10 рефералов (меняет бонус рефералки +20%)
+    """
+    user = await get_user(user_id)
+    if not user:
+        return {
+            "status_key": "novice",
+            "status_name": "НОВИЧОК",
+            "emoji": "🟢",
+            "shop_discount_add": 0.0,
+            "transfer_commission_multiplier": 1.0,
+            "credit_limit_multiplier": 1.0,
+            "referral_bonus_multiplier": 1.0,
+        }
+
+    duels_won = int(user.get("duels_won") or 0)
+    salary_count = int(user.get("salary_count") or 0)
+    balance = int(user.get("balance") or 0)
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT COUNT(*) AS cnt FROM businesses WHERE owner_id = ? AND is_active = 1",
+            (user_id,),
+        )
+        biz_cnt = int((await cur.fetchone())["cnt"] or 0)
+        cur = await db.execute(
+            "SELECT COUNT(*) AS cnt FROM referral_invites WHERE inviter_id = ? AND credited_at IS NOT NULL",
+            (user_id,),
+        )
+        ref_cnt = int((await cur.fetchone())["cnt"] or 0)
+
+    legend_ids = await get_legend_top3_ids_for_month()
+    is_legend = user_id in legend_ids
+    is_agitator = ref_cnt >= 10
+    is_mafia = duels_won >= 100 and biz_cnt >= 10 and balance >= 1_000_000
+    is_master = duels_won >= 50 and biz_cnt >= 5
+    is_stajer = salary_count >= 10 and biz_cnt >= 1
+
+    # Отображение приоритета.
+    if is_legend:
+        status_key, status_name, emoji = "legend", "ЛЕГЕНДА", "🔴"
+    elif is_mafia:
+        status_key, status_name, emoji = "mafia", "МАФИОЗИ", "🟠"
+    elif is_master:
+        status_key, status_name, emoji = "master", "МАСТЕР", "🟡"
+    elif is_stajer:
+        status_key, status_name, emoji = "trainee", "СТАЖЁР", "🔵"
+    elif is_agitator:
+        status_key, status_name, emoji = "agitator", "АГИТАТОР", "🟣"
+    else:
+        status_key, status_name, emoji = "novice", "НОВИЧОК", "🟢"
+
+    shop_discount_add = 0.0
+    transfer_commission_multiplier = 1.0
+    credit_limit_multiplier = 1.0
+    referral_bonus_multiplier = 1.2 if is_agitator else 1.0
+
+    if status_key == "master":
+        shop_discount_add = 0.03
+    elif status_key == "mafia":
+        shop_discount_add = 0.05
+    elif status_key == "legend":
+        shop_discount_add = 0.10
+
+    if status_key == "trainee":
+        transfer_commission_multiplier = 0.87
+    elif status_key == "legend":
+        transfer_commission_multiplier = 0.0
+
+    if status_key == "mafia":
+        credit_limit_multiplier = 1.5
+
+    return {
+        "status_key": status_key,
+        "status_name": status_name,
+        "emoji": emoji,
+        "shop_discount_add": shop_discount_add,
+        "transfer_commission_multiplier": transfer_commission_multiplier,
+        "credit_limit_multiplier": credit_limit_multiplier,
+        "referral_bonus_multiplier": referral_bonus_multiplier,
+        "biz_cnt": biz_cnt,
+        "ref_cnt": ref_cnt,
+        "duels_won": duels_won,
+        "is_legend": is_legend,
+        "is_agitator": is_agitator,
+    }
 
 
 def reputation_percent_from_row(user: Dict[str, Any]) -> float:
@@ -1077,7 +1257,7 @@ async def get_user(user_id: int) -> Optional[Dict[str, Any]]:
         user = await cursor.fetchone()
         return dict(user) if user else None
 
-async def register_user(user_id: int, username: str, full_name: str):
+async def register_user(user_id: int, username: str, full_name: str, referrer_id: Optional[int] = None):
     async with aiosqlite.connect(DB_NAME) as db:
         cursor = await db.execute("SELECT 1 FROM players WHERE user_id = ?", (user_id,))
         exists = await cursor.fetchone()
@@ -1090,19 +1270,31 @@ async def register_user(user_id: int, username: str, full_name: str):
                 "INSERT INTO transactions (user_id, type, amount, description) VALUES (?, 'registration', ?, 'Стартовый капитал')",
                 (user_id, ECONOMY_SETTINGS["start_balance"])
             )
+
+            # Если регистрация пришла по рефералке — фиксируем связь.
+            if referrer_id is not None and referrer_id != user_id:
+                await db.execute(
+                    """
+                    INSERT INTO referral_invites (inviter_id, invitee_id, credited_at, milestone, reward_inviter, reward_newcomer)
+                    VALUES (?, ?, NULL, 0, 0, 0)
+                    ON CONFLICT(invitee_id) DO NOTHING
+                    """,
+                    (referrer_id, user_id),
+                )
             await db.commit()
 
 async def update_balance(user_id: int, amount: int, txn_type: str, description: str):
     """Безопасное обновление баланса – баланс никогда не уходит в минус."""
     async with aiosqlite.connect(DB_NAME) as db:
         cursor = await db.execute(
-            "SELECT balance, full_name FROM players WHERE user_id = ?", (user_id,)
+            "SELECT balance, full_name, poor_alerted_at FROM players WHERE user_id = ?", (user_id,)
         )
         row = await cursor.fetchone()
         if not row:
             return
         current_balance = row[0]
         player_name = row[1] or str(user_id)
+        poor_alerted_at = row[2]
         new_balance = current_balance + amount
         if new_balance < 0:
             amount = -current_balance
@@ -1135,6 +1327,27 @@ async def update_balance(user_id: int, amount: int, txn_type: str, description: 
 
     if amount > 0 and txn_type in DAILY_EARN_TXN_TYPES:
         await add_daily_earned(user_id, amount)
+
+    # Уведомляем о падении баланса ниже порога.
+    if (
+        amount < 0
+        and new_balance > 0
+        and new_balance <= POOR_BALANCE_THRESHOLD
+        and current_balance > POOR_BALANCE_THRESHOLD
+    ):
+        now = datetime.now()
+        last = safe_parse_datetime(poor_alerted_at)
+        if not last or (now - last).total_seconds() >= POOR_ALERT_COOLDOWN_SEC:
+            await post_chronicle(
+                f"😢 Игрок {player_name} стал бедным. Баланс: {format_money(new_balance)}."
+            )
+            async with aiosqlite.connect(DB_NAME) as db2:
+                await db2.execute(
+                    "UPDATE players SET poor_alerted_at = ? WHERE user_id = ?",
+                    (now.isoformat(), user_id),
+                )
+                await db2.commit()
+
     if (
         amount < 0
         and new_balance == 0
@@ -1278,8 +1491,9 @@ async def buy_business(user_id: int, biz_key: str) -> tuple[bool, str]:
     if not user:
         return False, "❌ Сначала зарегистрируйся."
 
-    if user['balance'] < biz['price']:
-        return False, f"❌ Не хватает денег. Нужно {format_money(biz['price'])}."
+    biz_price = int(biz["price"] / BUSINESS_PRICE_DIVISOR)
+    if user['balance'] < biz_price:
+        return False, f"❌ Не хватает денег. Нужно {format_money(biz_price)}."
 
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
@@ -1288,11 +1502,11 @@ async def buy_business(user_id: int, biz_key: str) -> tuple[bool, str]:
         )
         await db.execute(
             "UPDATE players SET balance = balance - ? WHERE user_id = ?",
-            (biz['price'], user_id)
+            (biz_price, user_id)
         )
         await db.execute(
             "INSERT INTO transactions (user_id, type, amount, description) VALUES (?, 'business_buy', -?, ?)",
-            (user_id, biz['price'], f"Покупка {biz['name']}")
+            (user_id, biz_price, f"Покупка {biz['name']}")
         )
         await db.commit()
 
@@ -1510,8 +1724,10 @@ async def bank_pool_try_take(amount: int) -> bool:
         cur = await db.execute("SELECT liquidity FROM bank_pool WHERE id = 1")
         row = await cur.fetchone()
         liq = int(row[0]) if row else 0
+        # Казна считается бесконечной: если не хватило ликвидности — "доначисляем".
         if liq < amount:
-            return False
+            await db.execute("UPDATE bank_pool SET liquidity = liquidity + ? WHERE id = 1", (amount - liq,))
+            await db.commit()
         await db.execute("UPDATE bank_pool SET liquidity = liquidity - ? WHERE id = 1", (amount,))
         await db.commit()
     return True
@@ -1522,6 +1738,24 @@ async def get_user_deposit(user_id: int) -> int:
         cur = await db.execute("SELECT amount FROM bank_deposits WHERE user_id = ?", (user_id,))
         row = await cur.fetchone()
         return int(row[0]) if row else 0
+
+
+async def get_user_deposit_details(user_id: int) -> Dict[str, Any]:
+    """Для отображения: сумма депозита, сколько процентов накоплено и когда было последнее начисление."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT amount, total_interest, last_interest_at FROM bank_deposits WHERE user_id = ?",
+            (user_id,),
+        )
+        row = await cur.fetchone()
+        if not row:
+            return {"amount": 0, "total_interest": 0, "last_interest_at": None}
+        return {
+            "amount": int(row["amount"] or 0),
+            "total_interest": int(row["total_interest"] or 0),
+            "last_interest_at": row["last_interest_at"],
+        }
 
 
 async def bank_player_deposit(user_id: int, amount: int) -> tuple[bool, str]:
@@ -1541,8 +1775,11 @@ async def bank_player_deposit(user_id: int, amount: int) -> tuple[bool, str]:
         if ch != 1:
             return False, "❌ Не удалось списать баланс."
         await db.execute(
-            """INSERT INTO bank_deposits (user_id, amount, last_interest_at) VALUES (?, ?, ?)
-               ON CONFLICT(user_id) DO UPDATE SET amount = amount + excluded.amount""",
+            """INSERT INTO bank_deposits (user_id, amount, total_interest, last_interest_at)
+               VALUES (?, ?, 0, ?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                   amount = amount + excluded.amount,
+                   last_interest_at = excluded.last_interest_at""",
             (user_id, amount, now),
         )
         await db.execute("UPDATE bank_pool SET liquidity = liquidity + ? WHERE id = 1", (amount,))
@@ -1553,21 +1790,68 @@ async def bank_player_deposit(user_id: int, amount: int) -> tuple[bool, str]:
         await db.commit()
     return True, f"✅ В кассе банка +{format_money(amount)}. Спасибо, коллега!"
 
+async def bank_accrue_deposit_interest_for_user(user_id: int) -> None:
+    """Начисляет проценты на вклад конкретного пользователя (для 'снятия в любой момент' без потери процентов)."""
+    now_dt = datetime.now()
+    now_iso = now_dt.isoformat()
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT amount, total_interest, last_interest_at FROM bank_deposits WHERE user_id = ? AND amount > 0",
+            (user_id,),
+        )
+        row = await cur.fetchone()
+        if not row:
+            return
+        amt = int(row["amount"])
+        total_interest = int(row["total_interest"] or 0)
+        last = safe_parse_datetime(row.get("last_interest_at")) or now_dt
+        hours = max(0.0, (now_dt - last).total_seconds() / 3600.0)
+        if hours <= 0:
+            return
+        rate = float(BANK_SETTINGS["deposit_hourly_rate"])
+        pay = int(amt * rate * hours)
+        if pay < 1:
+            # Всё равно обновляем last_interest_at, чтобы не копить "висящие" доли.
+            await db.execute(
+                "UPDATE bank_deposits SET last_interest_at = ? WHERE user_id = ?",
+                (now_iso, user_id),
+            )
+            await db.commit()
+            return
+
+        await db.execute(
+            "UPDATE bank_deposits SET amount = amount + ?, total_interest = total_interest + ?, last_interest_at = ? WHERE user_id = ?",
+            (pay, pay, now_iso, user_id),
+        )
+        await db.execute(
+            "INSERT INTO transactions (user_id, type, amount, description) VALUES (?, 'bank_deposit_interest', ?, ?)",
+            (user_id, pay, "%% по вкладу «Асфальт-Капитал»"),
+        )
+        await db.commit()
+
+    await add_daily_earned(user_id, pay)
+    try:
+        await bot.send_message(user_id, f"🏦 Проценты по вкладу обновлены: {format_money(pay)}.")
+    except Exception:
+        pass
+
 
 async def bank_player_withdraw(user_id: int, amount: int) -> tuple[bool, str]:
     if amount <= 0:
         return False, "❌ Сумма должна быть > 0."
+    await bank_accrue_deposit_interest_for_user(user_id)
     dep = await get_user_deposit(user_id)
+    if dep <= 0:
+        return False, "❌ На вкладе нет средств."
     if amount > dep:
         return False, f"❌ На вкладе только {format_money(dep)}."
-    pool = await get_bank_pool_liquidity()
-    if pool < amount:
-        return (
-            False,
-            f"❌ В кассе сейчас {format_money(pool)} — не хватает свободной ликвидности "
-            f"(часть средств в выданных кредитах). Попробуй позже или меньшую сумму.",
-        )
     async with aiosqlite.connect(DB_NAME) as db:
+        # Убедимся, что касса (казна) может выплатить.
+        pool = await get_bank_pool_liquidity()
+        if pool < amount:
+            await bank_pool_add(amount - pool)
+
         await db.execute(
             "UPDATE bank_pool SET liquidity = liquidity - ? WHERE id = 1 AND liquidity >= ?",
             (amount, amount),
@@ -1595,14 +1879,54 @@ async def bank_player_withdraw(user_id: int, amount: int) -> tuple[bool, str]:
     return True, f"✅ {format_money(amount)} возвращены на баланс."
 
 
+async def bank_player_close_deposit(user_id: int) -> tuple[bool, str]:
+    """Закрывает депозит и забирает всю сумму вместе с накопленными процентами."""
+    await bank_accrue_deposit_interest_for_user(user_id)
+    dep_details = await get_user_deposit_details(user_id)
+    dep_amt = int(dep_details["amount"])
+    dep_interest = int(dep_details["total_interest"])
+    if dep_amt <= 0:
+        return False, "❌ У тебя нет активного депозита."
+
+    pool = await get_bank_pool_liquidity()
+    if pool < dep_amt:
+        await bank_pool_add(dep_amt - pool)
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "UPDATE bank_pool SET liquidity = liquidity - ? WHERE id = 1 AND liquidity >= ?",
+            (dep_amt, dep_amt),
+        )
+        cur = await db.execute("SELECT changes()")
+        if (await cur.fetchone())[0] != 1:
+            await db.rollback()
+            return False, "❌ Касса банка не смогла подтвердить закрытие депозита."
+        await db.execute(
+            "UPDATE bank_deposits SET amount = 0, total_interest = 0, last_interest_at = NULL WHERE user_id = ?",
+            (user_id,),
+        )
+        await db.execute("UPDATE players SET balance = balance + ? WHERE user_id = ?", (dep_amt, user_id))
+        await db.execute(
+            "INSERT INTO transactions (user_id, type, amount, description) VALUES (?, 'bank_withdraw', ?, ?)",
+            (user_id, dep_amt, "Возврат вклада из «Асфальт-Капитал» (закрытие депозита)"),
+        )
+        await db.commit()
+
+    return True, (
+        f"✅ Депозит закрыт!\n"
+        f"Забрал: {format_money(dep_amt)}.\n"
+        f"Проценты за всё время: {format_money(dep_interest)}."
+    )
+
+
 async def bank_deposit_interest_tick():
-    """Проценты по вкладам — только из ликвидности кассы."""
+    """Проценты по вкладам: начисляем на сумму вклада (без прямого выдачи на баланс)."""
     now = datetime.now()
     rate = float(BANK_SETTINGS["deposit_hourly_rate"])
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
-            "SELECT user_id, amount, last_interest_at FROM bank_deposits WHERE amount > 0"
+            "SELECT user_id, amount, total_interest, last_interest_at FROM bank_deposits WHERE amount > 0"
         )
         rows = [dict(r) for r in await cur.fetchall()]
     for r in rows:
@@ -1615,24 +1939,10 @@ async def bank_deposit_interest_tick():
         pay = int(amt * rate * hours)
         if pay < 1:
             continue
-        pool = await get_bank_pool_liquidity()
-        pay = min(pay, pool)
-        if pay <= 0:
-            continue
         async with aiosqlite.connect(DB_NAME) as db:
             await db.execute(
-                "UPDATE bank_pool SET liquidity = liquidity - ? WHERE id = 1 AND liquidity >= ?",
-                (pay, pay),
-            )
-            ccur = await db.execute("SELECT changes()")
-            if (await ccur.fetchone())[0] != 1:
-                continue
-            await db.execute(
-                "UPDATE players SET balance = balance + ? WHERE user_id = ?", (pay, uid)
-            )
-            await db.execute(
-                "UPDATE bank_deposits SET last_interest_at = ? WHERE user_id = ?",
-                (now.isoformat(), uid),
+                "UPDATE bank_deposits SET amount = amount + ?, total_interest = total_interest + ?, last_interest_at = ? WHERE user_id = ?",
+                (pay, pay, now.isoformat(), uid),
             )
             await db.execute(
                 "INSERT INTO transactions (user_id, type, amount, description) VALUES (?, 'bank_deposit_interest', ?, ?)",
@@ -1643,7 +1953,7 @@ async def bank_deposit_interest_tick():
         try:
             await bot.send_message(
                 uid,
-                f"🏦 Начислены проценты по вкладу: {format_money(pay)} (из кассы банка).",
+                f"🏦 Начислены проценты по вкладу: {format_money(pay)} (на вклад)."
             )
         except Exception:
             pass
@@ -1663,26 +1973,23 @@ async def get_active_bank_loan(user_id: int) -> Optional[Dict[str, Any]]:
 async def issue_bank_loan(user_id: int, amount: int) -> tuple[bool, str]:
     if amount < BANK_SETTINGS["min_loan"]:
         return False, f"❌ Минимум {format_money(BANK_SETTINGS['min_loan'])}."
-    if amount > BANK_SETTINGS["max_loan"]:
-        return False, f"❌ Максимум {format_money(BANK_SETTINGS['max_loan'])}."
     if await get_active_bank_loan(user_id):
         return False, "❌ У тебя уже есть активный кредит. Погаси его в банке."
     user = await get_user(user_id)
     if not user:
         return False, "❌ Пользователь не найден."
-    pool = await get_bank_pool_liquidity()
-    cap = min(BANK_SETTINGS["max_loan"], pool)
-    if cap < BANK_SETTINGS["min_loan"]:
-        return (
-            False,
-            "❌ В кассе банка не хватает свободных денег на кредит. "
-            "Все средства в обороте — подожди, пока коллеги внесут вклады или вернут долги.",
+
+    # Соц.статус «Мафиози» расширяет кредитный лимит.
+    async with aiosqlite.connect(DB_NAME) as db:
+        cur = await db.execute(
+            "SELECT COUNT(*) AS cnt FROM businesses WHERE owner_id = ? AND is_active = 1",
+            (user_id,),
         )
-    if amount > cap:
-        return (
-            False,
-            f"❌ Сейчас можно не больше {format_money(cap)} (лимит правил и остаток в кассе: {format_money(pool)}).",
-        )
+        biz_cnt = int((await cur.fetchone())[0] or 0)
+    is_mafia = int(user.get("duels_won") or 0) >= 100 and biz_cnt >= 10 and int(user.get("balance") or 0) >= 1_000_000
+    max_cap = int(BANK_SETTINGS["max_loan"] * (1.5 if is_mafia else 1.0))
+    if amount > max_cap:
+        return False, f"❌ Максимум для твоего статуса: {format_money(max_cap)}."
     rep = reputation_percent_from_row(user)
     approve_chance = 0.55 + 0.44 * (rep / 100.0)
     if random.random() > approve_chance:
@@ -1691,8 +1998,8 @@ async def issue_bank_loan(user_id: int, amount: int) -> tuple[bool, str]:
             "❌ Асфальт-Капитал отказал: низкая репутация или подозрительная история. "
             "Прокачай отзывы после сделок и дуэлей.",
         )
-    if not await bank_pool_try_take(amount):
-        return False, "❌ Касса изменилась — попробуй ещё раз (не хватило ликвидности)."
+    # Казна считается бесконечной: если не хватило, pool будет “доначислен” автоматически.
+    await bank_pool_try_take(amount)
     now = datetime.now()
     due = now + timedelta(hours=BANK_SETTINGS["term_hours"])
     try:
@@ -1709,7 +2016,7 @@ async def issue_bank_loan(user_id: int, amount: int) -> tuple[bool, str]:
         logger.error(f"Кредит: откат пула после ошибки: {e}")
         await bank_pool_add(amount)
         return False, "❌ Техническая ошибка при выдаче кредита. Попробуй позже."
-    return True, f"✅ {format_money(amount)} зачислены из кассы банка. Вернёшь с процентами до {due.strftime('%d.%m %H:%M')}."
+    return True, f"✅ {format_money(amount)} выданы из казны банка. Вернёшь с процентами до {due.strftime('%d.%m %H:%M')}."
 
 
 async def _set_loan_remaining(loan_id: int, remaining: int, paid_off: int = 0):
@@ -1825,14 +2132,17 @@ async def bank_collector_tick():
             "SELECT * FROM asphalt_loans WHERE paid_off = 0 AND remaining > 0 AND defaulted = 1"
         )
         loans = [dict(r) for r in await cursor.fetchall()]
-    pct = BANK_SETTINGS["collector_seize_balance_pct"] / 100.0
-    mn = BANK_SETTINGS["collector_min_seize"]
+    mn = int(BANK_SETTINGS.get("collector_min_seize", 1))
+    min_pct = float(BANK_SETTINGS.get("collector_seize_balance_min_pct", 0.10))
+    max_pct = float(BANK_SETTINGS.get("collector_seize_balance_max_pct", 0.20))
     for loan in loans:
         uid = loan["user_id"]
         user = await get_user(uid)
         if not user or user["balance"] <= 0:
             continue
-        seize = max(mn, int(user["balance"] * pct))
+        seize_pct = random.uniform(min_pct, max_pct)
+        seize = int(user["balance"] * seize_pct)
+        seize = max(mn, seize)
         seize = min(seize, user["balance"], loan["remaining"])
         if seize <= 0:
             continue
@@ -1889,22 +2199,14 @@ def get_bank_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="🏦 Касса банка", callback_data="bank_info_pool"),
-            ],
-            [
-                InlineKeyboardButton(text="💵 Вклад", callback_data="bank_dep_start"),
-                InlineKeyboardButton(text="📤 Вывести вклад", callback_data="bank_wd_start"),
-            ],
-            [
-                InlineKeyboardButton(text=f"➕ {format_money(5000)}", callback_data="bank_take_5000"),
-                InlineKeyboardButton(text=f"➕ {format_money(15000)}", callback_data="bank_take_15000"),
-            ],
-            [
-                InlineKeyboardButton(text=f"➕ {format_money(40000)}", callback_data="bank_take_40000"),
-                InlineKeyboardButton(text="✏️ Своя сумма", callback_data="bank_take_custom"),
+                InlineKeyboardButton(text="💰 Инвестировать", callback_data="bank_dep_start"),
+                InlineKeyboardButton(text="📈 Взять кредит", callback_data="bank_loan_start"),
             ],
             [
                 InlineKeyboardButton(text="💳 Погасить долг", callback_data="bank_repay_start"),
+                InlineKeyboardButton(text="🏦 Закрыть депозит", callback_data="bank_dep_close"),
+            ],
+            [
                 InlineKeyboardButton(text="📋 Статус", callback_data="bank_status"),
             ],
             [InlineKeyboardButton(text="🔙 Закрыть", callback_data="bank_close")],
@@ -1928,6 +2230,7 @@ def get_main_keyboard(user_id: int = None) -> ReplyKeyboardMarkup:
         [KeyboardButton(text="🔁 Перевод"), KeyboardButton(text="🎮 Мини-игры")],
         [KeyboardButton(text="🏢 Бизнес"), KeyboardButton(text="📊 Статистика")],
         [KeyboardButton(text="🎒 Инвентарь"), KeyboardButton(text="🏅 Ачивки")],
+        [KeyboardButton(text="👥 Рефералы")],
         [KeyboardButton(text="💊 Эффекты"), KeyboardButton(text="🏦 Асфальт-Капитал")],
     ]
     if user_id == ADMIN_ID:
@@ -2062,6 +2365,9 @@ class AdminBonusStates(StatesGroup):
 
 class AdminBankInjectStates(StatesGroup):
     waiting_amount = State()
+
+class AdminEconomySetStates(StatesGroup):
+    waiting_value = State()
 
 
 class CheckStates(StatesGroup):
@@ -2253,23 +2559,31 @@ async def deactivate_check(check_id: str):
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     args = message.text.split()
+    referrer_id: Optional[int] = None
     if len(args) > 1:
-        check_id = args[1].upper()
-        async with aiosqlite.connect(DB_NAME) as db:
-            db.row_factory = aiosqlite.Row
-            cursor = await db.execute('''
-                SELECT 1 FROM gift_checks 
-                WHERE check_id = ? AND is_active = 1
-                AND (expires_at IS NULL OR expires_at > ?)
-            ''', (check_id, datetime.now().isoformat()))
-            check_exists = await cursor.fetchone()
-        if check_exists:
-            await handle_check_activation(message, check_id)
-            return
+        payload = args[1].strip()
+        if payload.lower().startswith("ref_"):
+            try:
+                referrer_id = int(payload[4:])
+            except ValueError:
+                referrer_id = None
+        else:
+            check_id = payload.upper()
+            async with aiosqlite.connect(DB_NAME) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute('''
+                    SELECT 1 FROM gift_checks 
+                    WHERE check_id = ? AND is_active = 1
+                    AND (expires_at IS NULL OR expires_at > ?)
+                ''', (check_id, datetime.now().isoformat()))
+                check_exists = await cursor.fetchone()
+            if check_exists:
+                await handle_check_activation(message, check_id)
+                return
     user_id = message.from_user.id
     username = message.from_user.username or "Без username"
     full_name = message.from_user.full_name
-    await register_user(user_id, username, full_name)
+    await register_user(user_id, username, full_name, referrer_id=referrer_id)
     user = await get_user(user_id)
     nagirt_effects = await get_active_nagirt_effects(user_id)
     tolerance = await get_nagirt_tolerance(user_id)
@@ -2521,7 +2835,9 @@ async def handle_buy_item(callback: CallbackQuery):
         await callback.answer("❌ Товар не найден!", show_alert=True)
         return
     mods = await get_player_modifiers(user_id)
-    discount = float(mods.get("shop_discount", 0.0))
+    social = await get_social_status_for_user(user_id)
+    discount = float(mods.get("shop_discount", 0.0)) + float(social.get("shop_discount_add", 0.0))
+    discount = max(0.0, min(0.85, discount))
     price = max(1, int(round(item["price"] * (1.0 - discount))))
     if user["balance"] < price:
         await callback.answer(
@@ -2548,7 +2864,7 @@ async def handle_buy_item(callback: CallbackQuery):
         return
 
     user = await get_user(user_id)
-    disc_note = f"\n🏷 Скидка по ачивке: −{int(discount*100)}%" if discount > 0 else ""
+    disc_note = f"\n🏷 Итоговая скидка: −{int(discount*100)}%" if discount > 0 else ""
     response = (
         f"✅ *Покупка*\n\n"
         f"📦 *{item['name']}* добавлен в инвентарь (×1)\n"
@@ -3331,7 +3647,8 @@ async def biz_shop(callback: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[])
 
     for key, biz in BUSINESS_TYPES.items():
-        text += f"**{biz['name']}** — {format_money(biz['price'])}\n"
+        display_price = int(biz["price"] / BUSINESS_PRICE_DIVISOR)
+        text += f"**{biz['name']}** — {format_money(display_price)}\n"
         text += f"_{biz['description']}_\n"
         text += f"💰 Доход: {format_money(biz['base_income'])}/ч\n"
         if biz.get('salary_bonus'):
@@ -3619,11 +3936,13 @@ async def handle_transfer_amount(message: Message, state: FSMContext):
             return
         ge = await get_global_economy()
         mods = await get_player_modifiers(user_id)
+        social = await get_social_status_for_user(user_id)
         rep_s = reputation_percent_from_row(sender)
         fee_mult = 1.12 - 0.24 * (rep_s / 100.0)
         base_fee = int(amount * ge["transfer_commission_pct"] * fee_mult)
         kidala_extra = int(amount * float(mods.get("transfer_extra_fee", 0.0)))
-        fee = max(0, base_fee + kidala_extra)
+        comm_mult = float(social.get("transfer_commission_multiplier", 1.0))
+        fee = max(0, int((base_fee + kidala_extra) * comm_mult))
         total_debit = amount + fee
         if total_debit > sender["balance"]:
             await message.answer(
@@ -3973,25 +4292,22 @@ async def admin_economy_menu(callback: CallbackQuery):
     ge = await get_global_economy()
     txt = (
         "📈 *Глобальная экономика*\n\n"
-        f"• Множитель случайных штрафов: ×{ge['fine_scale']:.2f}\n"
-        f"• Комиссия переводов (база): {ge['transfer_commission_pct']*100:.1f}%\n"
-        f"• Шанс налога на бизнес: {ge['business_tax_chance']*100:.0f}%\n"
-        f"• Доля конфискации при налоге: {ge['business_tax_take_pct']*100:.0f}%\n\n"
-        "Кнопки — *поднять* параметр. Снижение через отрицательные шаги позже в коде при необходимости."
+        "Введите значение числами (шаги кнопками не используются).\n\n"
+        f"• Множитель штрафов (`fine_scale`): ×{ge['fine_scale']:.2f}\n"
+        f"• Комиссия переводов (`transfer_commission_pct`): {ge['transfer_commission_pct']*100:.2f}%\n"
+        f"• Шанс налога на бизнес (`business_tax_chance`): {ge['business_tax_chance']*100:.2f}%\n"
+        f"• Доля конфискации (`business_tax_take_pct`): {ge['business_tax_take_pct']*100:.2f}%\n\n"
+        "Выберите параметр:"
     )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="Штрафы +10%", callback_data="adeca_fine_p1"),
-                InlineKeyboardButton(text="Штрафы +25%", callback_data="adeca_fine_p25"),
+                InlineKeyboardButton(text="Штрафы (fine_scale)", callback_data="admin_econ_choose_fine_scale"),
+                InlineKeyboardButton(text="Комиссия переводов", callback_data="admin_econ_choose_transfer_commission_pct"),
             ],
             [
-                InlineKeyboardButton(text="Комиссия +0.5п.п.", callback_data="adeca_comm_p005"),
-                InlineKeyboardButton(text="Комиссия +1п.п.", callback_data="adeca_comm_p01"),
-            ],
-            [
-                InlineKeyboardButton(text="Налог: шанс +5%", callback_data="adeca_taxch_p05"),
-                InlineKeyboardButton(text="Налог: доля +5%", callback_data="adeca_taxtk_p05"),
+                InlineKeyboardButton(text="Налог: шанс", callback_data="admin_econ_choose_business_tax_chance"),
+                InlineKeyboardButton(text="Налог: доля", callback_data="admin_econ_choose_business_tax_take_pct"),
             ],
             [InlineKeyboardButton(text="🔙 Админка", callback_data="admin_back")],
         ]
@@ -4001,6 +4317,82 @@ async def admin_economy_menu(callback: CallbackQuery):
     except Exception:
         await callback.message.answer(txt, parse_mode="Markdown", reply_markup=kb)
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("admin_econ_choose_"))
+async def admin_economy_choose_param(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer("⛔", show_alert=True)
+        return
+    param = callback.data[len("admin_econ_choose_") :]
+    if param not in {"fine_scale", "transfer_commission_pct", "business_tax_chance", "business_tax_take_pct"}:
+        await callback.answer("❌ Неизвестный параметр", show_alert=True)
+        return
+    await state.update_data(param=param)
+    await state.set_state(AdminEconomySetStates.waiting_value)
+    await callback.message.answer(
+        "🔢 Введи новое значение числом.\n"
+        "Пример для `fine_scale`: 1.20\n"
+        "Пример для `transfer_commission_pct`: 0.025 (это 2.5%)\n\n"
+        "Отмена: напиши `отмена`.",
+    )
+    await callback.answer()
+
+
+@dp.message(AdminEconomySetStates.waiting_value)
+async def admin_economy_set_value(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        await state.clear()
+        return
+    if not message.text:
+        return
+    if message.text.strip().lower() == "отмена":
+        await state.clear()
+        await message.answer("Ок, отменено.", reply_markup=get_admin_keyboard())
+        return
+    try:
+        val = float(message.text.strip().replace(",", "."))
+    except ValueError:
+        await message.answer("❌ Нужно число. Например: 1.20 или 0.025")
+        return
+
+    data = await state.get_data()
+    param = data.get("param")
+    if not param:
+        await state.clear()
+        await message.answer("❌ Не выбран параметр. Попробуй заново.")
+        return
+
+    ge = await set_global_economy_param(param, val)
+    await post_chronicle(
+        f"📢 *Виталик крутит гайки:* обновлены глобальные штрафы/налоги/комиссии. "
+        f"Штрафы ×{ge['fine_scale']:.2f}, комиссия {ge['transfer_commission_pct']*100:.2f}%."
+    )
+    await state.clear()
+
+    txt = (
+        "📈 *Глобальная экономика*\n\n"
+        "Текущие значения:\n\n"
+        f"• Множитель штрафов (`fine_scale`): ×{ge['fine_scale']:.2f}\n"
+        f"• Комиссия переводов (`transfer_commission_pct`): {ge['transfer_commission_pct']*100:.2f}%\n"
+        f"• Шанс налога на бизнес (`business_tax_chance`): {ge['business_tax_chance']*100:.2f}%\n"
+        f"• Доля конфискации (`business_tax_take_pct`): {ge['business_tax_take_pct']*100:.2f}%\n\n"
+        "Выберите параметр:"
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Штрафы (fine_scale)", callback_data="admin_econ_choose_fine_scale"),
+                InlineKeyboardButton(text="Комиссия переводов", callback_data="admin_econ_choose_transfer_commission_pct"),
+            ],
+            [
+                InlineKeyboardButton(text="Налог: шанс", callback_data="admin_econ_choose_business_tax_chance"),
+                InlineKeyboardButton(text="Налог: доля", callback_data="admin_econ_choose_business_tax_take_pct"),
+            ],
+            [InlineKeyboardButton(text="🔙 Админка", callback_data="admin_back")],
+        ]
+    )
+    await message.answer(txt, parse_mode="Markdown", reply_markup=kb)
 
 
 @dp.callback_query(F.data.startswith("adeca_"))
@@ -4037,34 +4429,80 @@ async def format_bank_menu_text(user_id: int) -> Optional[str]:
         return None
     await bank_accrue_interest_tick()
     loan = await get_active_bank_loan(user_id)
+    dep_details = await get_user_deposit_details(user_id)
+    dep_amt = int(dep_details["amount"])
+    dep_interest = int(dep_details["total_interest"])
+
     rep_v = reputation_percent_from_row(user)
-    pool = await get_bank_pool_liquidity()
-    dep = await get_user_deposit(user_id)
+
+    dep_rate_h = float(BANK_SETTINGS["deposit_hourly_rate"])
+    dep_rate_day = dep_rate_h * 24.0
+    loan_rate_h = float(BANK_SETTINGS["hourly_interest_rate"])
+    loan_rate_day = loan_rate_h * 24.0
+
+    interval_sec = int(BANK_SETTINGS.get("deposit_interest_interval_sec", 3600))
+    last_dt = safe_parse_datetime(dep_details["last_interest_at"]) if dep_details["last_interest_at"] else None
+    next_in_sec = None
+    if dep_amt > 0 and last_dt:
+        elapsed = (datetime.now() - last_dt).total_seconds()
+        next_in_sec = max(0, int(interval_sec - elapsed))
+
+    next_in_s = "—"
+    if next_in_sec is not None:
+        mins = next_in_sec // 60
+        next_in_s = f"через {mins} мин" if mins > 0 else "сейчас"
+
+    # Лимит кредита расширяется для «Мафиози».
+    async with aiosqlite.connect(DB_NAME) as db:
+        cur = await db.execute(
+            "SELECT COUNT(*) AS cnt FROM businesses WHERE owner_id = ? AND is_active = 1",
+            (user_id,),
+        )
+        biz_cnt = int((await cur.fetchone())[0] or 0)
+    is_mafia = int(user.get("duels_won") or 0) >= 100 and biz_cnt >= 10 and int(user.get("balance") or 0) >= 1_000_000
+    max_loan_cap = int(BANK_SETTINGS["max_loan"] * (1.5 if is_mafia else 1.0))
+
     text = (
-        f"🏦 *{BANK_SETTINGS['name']}*\n"
-        f"_Касса (ликвидность): {format_money(pool)}_\n"
-        f"_Твой вклад: {format_money(dep)} — деньги в общем пуле; проценты платятся из кассы._\n"
-        f"_Кредит выдаётся только если в кассе есть свободные средства._\n\n"
+        "🏦 *АСФАЛЬТ-КАПИТАЛ*\n"
         f"💰 Баланс: {format_money(user['balance'])}\n"
-        f"⭐ Репутация: {rep_v:.0f}/100 _(выше — чаще одобряют кредит)_\n\n"
-        f"📌 Условия кредита:\n"
-        f"• Сумма: {format_money(BANK_SETTINGS['min_loan'])} — {format_money(BANK_SETTINGS['max_loan'])}\n"
-        f"• Процент: ~{BANK_SETTINGS['hourly_interest_rate']*100:.1f}% в час от остатка долга\n"
-        f"• Срок: {BANK_SETTINGS['term_hours']} ч, потом *коллекторы* и удержание с получки\n\n"
+        f"⭐ Репутация: {rep_v:.0f}/100 _(влияет на одобрение кредитов)_\n\n"
+        "📊 *Депозиты (вклады)*\n"
+        f"• Ставка: {dep_rate_h*100:.1f}% в час (~{dep_rate_day*100:.0f}% в сутки)\n"
+        f"• Минимум: {format_money(BANK_SETTINGS['min_deposit'])}\n"
+        f"• Твой депозит: {format_money(dep_amt)}\n"
     )
+
+    if dep_amt > 0:
+        text += (
+            f"• Начислено за всё время: {format_money(dep_interest)}\n"
+            f"• Следующее начисление: {next_in_s}\n"
+            "\n"
+        )
+    else:
+        text += "• Начислений пока нет\n\n"
+
+    text += (
+        "📈 *Кредиты (заёмы)*\n"
+        f"• Ставка: {loan_rate_h*100:.1f}% в час (~{loan_rate_day*100:.0f}% в сутки)\n"
+        f"• Минимум: {format_money(BANK_SETTINGS['min_loan'])}\n"
+        f"• Максимум: {format_money(max_loan_cap)}\n"
+        f"• Срок: {BANK_SETTINGS['term_hours']} ч\n"
+        "\n"
+    )
+
     if loan:
         due = safe_parse_datetime(loan["due_at"])
         due_s = due.strftime("%d.%m %H:%M") if due else "—"
         st = "🔴 ПРОСРОЧКА / коллекторы" if loan.get("defaulted") else "🟢 В сроке"
         text += (
-            f"📋 *Активный кредит:*\n"
+            "📋 *Твой долг*\n"
+            f"• Остаток долга: {format_money(loan['remaining'])}\n"
             f"• Взято: {format_money(loan['principal'])}\n"
-            f"• Долг с %%: {format_money(loan['remaining'])}\n"
-            f"• Вернуть до: {due_s}\n"
+            f"• До: {due_s}\n"
             f"• Статус: {st}\n"
         )
     else:
-        text += "✅ Активных кредитов нет — можно взять деньги под процент.\n"
+        text += "✅ Активного долга нет — можешь взять кредит.\n"
     return text
 
 
@@ -4135,12 +4573,53 @@ async def bank_dep_start_cb(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(BankStates.waiting_deposit_amt)
     await callback.message.answer(
-        f"💵 *Вклад в кассу*\n\n"
+        f"💰 *Инвестировать в «{BANK_SETTINGS['name']}»*\n\n"
         f"Минимум: {format_money(BANK_SETTINGS['min_deposit'])}\n"
+        f"Ставка: {float(BANK_SETTINGS['deposit_hourly_rate'])*100:.1f}% в час (~{float(BANK_SETTINGS['deposit_hourly_rate'])*24*100:.0f}% в сутки)\n"
         f"Баланс: {format_money(user['balance'])}\n\n"
-        f"Введи сумму одним числом (деньги уйдут с баланса в общий пул).",
+        f"Введи сумму одним числом (деньги замораживаются на вкладе).",
         parse_mode="Markdown",
     )
+
+@dp.callback_query(F.data == "bank_loan_start")
+async def bank_loan_start_cb(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    uid = callback.from_user.id
+    user = await get_user(uid)
+    if not user:
+        await callback.message.answer(NOT_REGISTERED_HINT)
+        return
+    async with aiosqlite.connect(DB_NAME) as db:
+        cur = await db.execute(
+            "SELECT COUNT(*) AS cnt FROM businesses WHERE owner_id = ? AND is_active = 1",
+            (uid,),
+        )
+        biz_cnt = int((await cur.fetchone())[0] or 0)
+    is_mafia = int(user.get("duels_won") or 0) >= 100 and biz_cnt >= 10 and int(user.get("balance") or 0) >= 1_000_000
+    max_loan = int(BANK_SETTINGS["max_loan"] * (1.5 if is_mafia else 1.0))
+    await state.set_state(BankStates.waiting_custom_loan)
+    await callback.message.answer(
+        "📈 *Взять кредит*\n\n"
+        f"Минимум: {format_money(BANK_SETTINGS['min_loan'])}\n"
+        f"Максимум: {format_money(max_loan)}\n"
+        f"Ставка: {float(BANK_SETTINGS['hourly_interest_rate'])*100:.1f}% в час\n"
+        f"Срок: {BANK_SETTINGS['term_hours']} ч\n\n"
+        "Введи сумму одним числом.",
+        parse_mode="Markdown",
+    )
+
+@dp.callback_query(F.data == "bank_dep_close")
+async def bank_dep_close_cb(callback: CallbackQuery):
+    await callback.answer()
+    uid = callback.from_user.id
+    dep = await get_user_deposit(uid)
+    if dep <= 0:
+        await callback.message.answer("❌ У тебя нет активного депозита.")
+        return
+    ok, msg = await bank_player_close_deposit(uid)
+    await callback.message.answer(msg)
+    if ok:
+        await send_bank_menu(callback.message, uid)
 
 
 @dp.callback_query(F.data == "bank_wd_start")
@@ -5037,7 +5516,7 @@ async def handle_statistics(message: Message):
     async with aiosqlite.connect(DB_NAME) as db:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT full_name, balance, total_earned, asphalt_meters FROM players ORDER BY balance DESC LIMIT 10"
+            "SELECT user_id, full_name, balance, total_earned, asphalt_meters FROM players ORDER BY balance DESC LIMIT 10"
         )
         top_players = await cursor.fetchall()
         cursor = await db.execute("SELECT COUNT(*) as total, SUM(balance) as total_balance FROM players")
@@ -5055,6 +5534,7 @@ async def handle_statistics(message: Message):
         )
         top_day_rows = await cursor.fetchall()
     rep_val = reputation_percent_from_row(user)
+    social = await get_social_status_for_user(user_id)
     ach_ids = await get_unlocked_achievement_ids(user_id)
     ach_line = ""
     if ach_ids:
@@ -5070,6 +5550,7 @@ async def handle_statistics(message: Message):
         f"• Имя: {user['full_name']}\n"
         f"• Баланс: {format_money(user['balance'])}\n"
         f"• Репутация: {rep_val:.0f}/100 _(выше — дешевле комиссия, выше шанс кредита)_\n"
+        f"• 🏅 Статус: {social['status_name']} {social['emoji']}\n"
         f"• Заработок сегодня (МСК): {format_money(today_earned)}\n"
         f"• Побед в дуэлях: {user.get('duels_won', 0)}\n"
         f"{ach_line}"
@@ -5128,8 +5609,95 @@ async def handle_statistics(message: Message):
         for i, player in enumerate(top_players, 1):
             medal = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"][i-1]
             name = player['full_name'][:15] + "..." if len(player['full_name']) > 15 else player['full_name']
-            stats_text += f"{medal} {name}: {format_money(player['balance'])}\n"
+            sp = await get_social_status_for_user(int(player["user_id"]))
+            stats_text += f"{medal} {name}: {format_money(player['balance'])} — {sp['status_name']} {sp['emoji']}\n"
     await message.answer(stats_text, parse_mode="Markdown")
+
+@dp.message(F.text == "👥 Рефералы")
+async def handle_referrals_menu(message: Message):
+    user_id = message.from_user.id
+    user = await get_user(user_id)
+    if not user:
+        await message.answer(NOT_REGISTERED_HINT)
+        return
+
+    bot_info = await bot.get_me()
+    bot_username = bot_info.username
+    if not bot_username:
+        await message.answer("❌ У бота нет username — невозможно показать реферальную ссылку.")
+        return
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """
+            SELECT
+                COUNT(*) AS invited,
+                COALESCE(SUM(reward_inviter), 0) AS earned
+            FROM referral_invites
+            WHERE inviter_id = ? AND credited_at IS NOT NULL
+            """,
+            (user_id,),
+        )
+        r = await cur.fetchone()
+        invited = int(r["invited"] or 0)
+        earned = int(r["earned"] or 0)
+
+        # Топ приглашающих.
+        cur = await db.execute(
+            """
+            SELECT inviter_id, COUNT(*) AS cnt
+            FROM referral_invites
+            WHERE credited_at IS NOT NULL
+            GROUP BY inviter_id
+            ORDER BY cnt DESC
+            LIMIT 3
+            """
+        )
+        top_rows = [dict(x) for x in await cur.fetchall()]
+
+    milestones = [
+        (1, 5000, 2000, ""),
+        (3, 15000, 5000, "буст 24ч"),
+        (5, 30000, 10000, "редкий предмет"),
+        # Агитатор: +20% к реферальному бонусу (применяется на 10-й кредит).
+        (10, 120000, 24000, "титул «Агитатор»"),
+    ]
+
+    lines = [
+        "👥 *РЕФЕРАЛЬНАЯ СИСТЕМА*",
+        "",
+        f"Ссылка: https://t.me/{bot_username}?start=ref_{user_id}",
+        f"Приглашено (активных): {invited}",
+        f"Заработано: {format_money(earned)}",
+        "",
+        "Доступно:",
+    ]
+
+    for m, inv_reward, new_reward, meta in milestones:
+        if invited >= m:
+            extra = f" + новичок {format_money(new_reward)}" if m in (1, 3, 5, 10) else ""
+            lines.append(f"✅ {m} друзей — получено (пригласившему {format_money(inv_reward)}{(' ' + meta) if meta else ''}){extra}")
+        else:
+            need = m - invited
+            lines.append(
+                f"⏳ {m} друзей — нужно ещё {need} (пригласившему {format_money(inv_reward)}"
+                f"{(' ' + meta) if meta else ''}, новичок +{format_money(new_reward)})"
+            )
+
+    lines.append("")
+    lines.append(f"⏳ Начисление: через {REFERRAL_DELAY_HOURS}ч после регистрации, защита: минимум {REFERRAL_ACTIONS_MIN} действий.")
+
+    if top_rows:
+        lines.append("")
+        lines.append("🥇 *Топ приглашающих:*")
+        for i, row in enumerate(top_rows, 1):
+            nm = await get_user(row["inviter_id"])
+            nm = nm["full_name"] if nm else str(row["inviter_id"])
+            medal = ("🥇", "🥈", "🥉")[i - 1] if i <= 3 else "🏅"
+            lines.append(f"{medal} {nm} — {row['cnt']}")
+
+    await message.answer("\n".join(lines), parse_mode="Markdown")
 
 @dp.message(F.text == "💊 Эффекты")
 async def handle_effects(message: Message):
@@ -5322,6 +5890,120 @@ async def business_notification_scheduler():
             logger.error(f"Ошибка в планировщике уведомлений о бизнесе: {e}")
             await asyncio.sleep(300)  # при ошибке ждём 5 минут
 
+# ==================== РЕФЕРАЛЬНАЯ СИСТЕМА ====================
+async def referral_credit_scheduler():
+    """Начисляет реферальные бонусы через 24ч после регистрации,
+    и только если новичок активен (минимум REFERRAL_ACTIONS_MIN действий)."""
+    await asyncio.sleep(10)
+    while True:
+        try:
+            now_dt = datetime.now()
+            delay_td = timedelta(hours=REFERRAL_DELAY_HOURS)
+
+            async with aiosqlite.connect(DB_NAME) as db:
+                db.row_factory = aiosqlite.Row
+                cur = await db.execute(
+                    "SELECT id, inviter_id, invitee_id, created_at FROM referral_invites WHERE credited_at IS NULL"
+                )
+                pending = [dict(r) for r in await cur.fetchall()]
+
+            for row in pending:
+                pending_created = safe_parse_datetime(row.get("created_at")) or now_dt
+                if now_dt - pending_created < delay_td:
+                    continue
+
+                inviter_id = int(row["inviter_id"])
+                invitee_id = int(row["invitee_id"])
+
+                invitee = await get_user(invitee_id)
+                inviter = await get_user(inviter_id)
+                if not invitee or not inviter:
+                    continue
+
+                # Защита от накрутки: только активный новичок.
+                async with aiosqlite.connect(DB_NAME) as db:
+                    cur = await db.execute(
+                        "SELECT COUNT(*) FROM transactions WHERE user_id = ? AND type != 'registration'",
+                        (invitee_id,),
+                    )
+                    action_count = int((await cur.fetchone())[0] or 0)
+
+                if action_count < REFERRAL_ACTIONS_MIN:
+                    continue
+
+                async with aiosqlite.connect(DB_NAME) as db:
+                    cur = await db.execute(
+                        "SELECT COUNT(*) FROM referral_invites WHERE inviter_id = ? AND credited_at IS NOT NULL",
+                        (inviter_id,),
+                    )
+                    credited_before = int((await cur.fetchone())[0] or 0)
+
+                after_credited = credited_before + 1
+
+                inviter_reward = 0
+                newcomer_reward = 0
+                milestone = after_credited
+
+                if after_credited == 1:
+                    inviter_reward = 5000
+                    newcomer_reward = 2000
+                elif after_credited == 3:
+                    inviter_reward = 15000
+                    newcomer_reward = 5000
+                elif after_credited == 5:
+                    inviter_reward = 30000
+                    newcomer_reward = 10000
+                elif after_credited == 10:
+                    inviter_reward = 100000
+                    newcomer_reward = 20000
+
+                # Агитатор (+20% к реферальному бонусу) — учитываем при 10-м приглашении.
+                if after_credited >= 10 and (inviter_reward > 0 or newcomer_reward > 0):
+                    inviter_reward = int(inviter_reward * 1.2)
+                    newcomer_reward = int(newcomer_reward * 1.2)
+
+                if inviter_reward > 0:
+                    await update_balance(
+                        inviter_id,
+                        inviter_reward,
+                        "referral_inviter",
+                        "Реферальный бонус (приглашение)",
+                    )
+                if newcomer_reward > 0:
+                    await update_balance(
+                        invitee_id,
+                        newcomer_reward,
+                        "referral_newcomer",
+                        "Реферальный бонус (новичок)",
+                    )
+
+                # Доп. награды/эффекты по ТЗ.
+                if after_credited == 3 and inviter_reward > 0:
+                    await add_boost(inviter_id, "premium_boost", 0.3, 24)
+                if after_credited == 5 and inviter_reward > 0:
+                    await add_inventory_item(inviter_id, "antidote", 1)
+                if after_credited == 10:
+                    await add_inventory_item(invitee_id, "antidote", 1)
+
+                async with aiosqlite.connect(DB_NAME) as db:
+                    await db.execute(
+                        "UPDATE referral_invites SET credited_at = ?, milestone = ?, reward_inviter = ?, reward_newcomer = ? WHERE id = ?",
+                        (
+                            now_dt.isoformat(),
+                            milestone,
+                            inviter_reward,
+                            newcomer_reward,
+                            row["id"],
+                        ),
+                    )
+                    await db.commit()
+
+        except Exception as e:
+            logger.error(f"referral_credit_scheduler ошибка: {e}")
+
+        await asyncio.sleep(300)
+
+
 # ==================== ЗАПУСК БОТА ====================
 async def on_startup():
     await init_db()
@@ -5335,6 +6017,7 @@ async def on_startup():
     asyncio.create_task(business_notification_scheduler())
     asyncio.create_task(bank_scheduler())
     asyncio.create_task(daily_top_scheduler())
+    asyncio.create_task(referral_credit_scheduler())
     logger.info(
         "✅ Бот запущен: бизнес, банк (пул + вклады), топ дня (10:00 МСК), инвентарь, кости, хроника."
     )
@@ -5349,13 +6032,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
-# ==================== КОНФИГУРАЦИЯ ====================
-# Токен лучше задать в переменной окружения BOT_TOKEN (не хранить в коде в продакшене).
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8619745303:AAHsEWaPKdPSbenRO7dzVCrDvxUIm0CzDu0")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "5775839902"))
-# Канал для «Криминальной хроники»: ID вида -100xxxxxxxxxx; бот должен быть админом канала.
-CHRONICLE_CHANNEL_ID = os.getenv("-1003008379294")
-CHRONICLE_CHANNEL_ID = int(CHRONICLE_CHANNEL_ID) if CHRONICLE_CHANNEL_ID else None
