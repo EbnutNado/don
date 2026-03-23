@@ -225,7 +225,7 @@ BANK_SETTINGS = {
     "name": "Асфальт-Капитал",
     "min_loan": 2_000,
     "max_loan": 200_000,
-    "hourly_interest_rate": 0.004,  # 0.4% в час
+    "hourly_interest_rate": 0.008,  # 0.4% в час
     "term_hours": 48,  # после срока — режим коллекторов
     # За начислениями следим раз в час.
     "accrual_interval_sec": 3600,
