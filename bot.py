@@ -5537,7 +5537,7 @@ async def handle_check_stats(callback: CallbackQuery):
 
     bot_info = await bot.get_me()
     bot_username = bot_info.username
-    if bot_username == "terekonik22bot":
+    if bot_username == "terekonik22_bot":
         bot_username = "terekonik22_bot"
     if bot_username:
         check_link = f"https://t.me/{bot_username}?start={check_id}"
