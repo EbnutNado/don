@@ -1,3 +1,54 @@
+# ==================== КОНФИГУРАЦИЯ ====================
+# Токен лучше задать в переменной окружения BOT_TOKEN (не хранить в коде в продакшене).
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8619745303:AAHsEWaPKdPSbenRO7dzVCrDvxUIm0CzDu0")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "5775839902"))
+# Telegram username бота для генерации ссылок вида https://t.me/<bot_username>?start=...
+# Если не задан — будет использован bot.get_me().username.
+# Формат допустим любой: "my_bot" или "@my_bot".
+BOT_USERNAME_MANUAL = "terekonik22_bot"  # впишите сюда "my_bot" (или "@my_bot"), если хотите задавать username прямо в коде
+BOT_USERNAME = (os.getenv("BOT_USERNAME", "").strip().lstrip("@") or BOT_USERNAME_MANUAL.strip().lstrip("@"))
+# Коррекции username по умолчанию включены (на случай несовпадения "username" и отображаемого t.me).
+ENABLE_USERNAME_CORRECTIONS = os.getenv("ENABLE_USERNAME_CORRECTIONS", "1").strip().lower() in ("1", "true", "yes", "on")
+# Хроника: задай CHRONICLE_CHANNEL_ID=-100... (число) ИЛИ CHRONICLE_CHANNEL_USERNAME=mychannel (без @).
+# Бот должен быть администратором канала с правом публикации.
+def _load_chronicle_config() -> tuple:
+    raw_id = os.getenv("CHRONICLE_CHANNEL_ID", "-1003008379294").strip()
+    raw_user = os.getenv("CHRONICLE_CHANNEL_USERNAME", "kamensk_avtodor_prorab").strip().lstrip("@")
+    cid: Optional[int] = None
+    if raw_id:
+        try:
+            cid = int(raw_id)
+        except ValueError:
+            logger_init = logging.getLogger(__name__)
+            logger_init.warning(
+                "CHRONICLE_CHANNEL_ID должен быть целым числом (например -1001234567890). "
+                "Используй CHRONICLE_CHANNEL_USERNAME для публичного канала."
+            )
+    return cid, (raw_user or None)
+
+
+CHRONICLE_CHANNEL_ID, CHRONICLE_CHANNEL_USERNAME = _load_chronicle_config()
+_chronicle_resolved_id: Optional[int] = None
+
+
+def _load_subscribe_config() -> tuple:
+    """
+    Канал для обязательной подписки.
+    Параметры:
+    - SUBSCRIBE_CHANNEL_ID (например -1001234567890)
+    - SUBSCRIBE_CHANNEL_USERNAME (например mychannel или @mychannel)
+    """
+    raw_id = os.getenv("SUBSCRIBE_CHANNEL_ID", "-1003008379294").strip()
+    raw_user = os.getenv("SUBSCRIBE_CHANNEL_USERNAME", "kamensk_avtodor_prorab").strip().lstrip("@")
+    cid: Optional[int] = None
+    if raw_id:
+        try:
+            cid = int(raw_id)
+        except ValueError:
+            cid = None
+    return cid, (raw_user or None)
+
+
 """
 Telegram бот "Виталик Штрафующий"
 ✅ Чеки исправлены | ✅ Дуэль без ухода в минус | ✅ Нагирт ужесточён
@@ -12,7 +63,7 @@ import random
 import string
 import time
 from datetime import datetime, timedelta
-from typing import List, Optional, Dict, Any, Union
+from typing import List, Optional, Dict, Any, Union, Tuple
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, types, F
@@ -240,34 +291,40 @@ BANK_SETTINGS = {
 # ==================== ТОВАРЫ МАГАЗИНА ====================
 SHOP_ITEMS = [
     {"id": "bonus_coin", "name": "🪙 Бонусная монета", "price": 1500,
-     "description": "+15% к получке на 8 часов", "type": "boost", "value": 0.15, "hours": 8},
+     "description": "+15% к получке на 8 часов", "type": "boost", "category": "boosts",
+     "value": 0.15, "hours": 8},
     {"id": "premium_boost", "name": "🚀 Премиум-Буст", "price": 5000,
-     "description": "+30% к получке на 24 часа", "type": "boost", "value": 0.3, "hours": 24},
+     "description": "+30% к получке на 24 часа", "type": "boost", "category": "boosts",
+     "value": 0.3, "hours": 24},
     {"id": "mega_boost", "name": "💎 Мега-Буст", "price": 15000,
-     "description": "+50% к получке на 3 дня", "type": "boost", "value": 0.5, "hours": 72},
+     "description": "+50% к получке на 3 дня", "type": "boost", "category": "boosts",
+     "value": 0.5, "hours": 72},
     {"id": "day_off", "name": "🎉 Выходной", "price": 3000,
-     "description": "Полный иммунитет к штрафам на 12 часов", "type": "protection", "hours": 12},
+     "description": "Полный иммунитет к штрафам на 12 часов", "type": "protection", "category": "protection", "hours": 12},
     {"id": "insurance", "name": "🛡️ Страховка", "price": 4000,
-     "description": "Страховка от одного штрафа (возмещает 80%)", "type": "insurance"},
+     "description": "Страховка от одного штрафа (возмещает 80%)", "type": "insurance", "category": "protection"},
 
     {"id": "nagirt_light", "name": "💊 Нагирт Лайт", "price": 2000,
      "description": "+15% к зарплате, +20% к играм на 2 часа. Риск штрафа +10%",
-     "type": "pill", "effect_salary": 0.15, "effect_game": 0.2, "hours": 2,
+     "type": "pill", "category": "nagirt",
+     "effect_salary": 0.15, "effect_game": 0.2, "hours": 2,
      "side_effect_chance": 25, "fine_bonus": 0.1},
     {"id": "nagirt_pro", "name": "💊💊 Нагирт Про", "price": 5000,
      "description": "+30% к зарплате, +40% к играм на 4 часа. Риск штрафа +25%",
-     "type": "pill", "effect_salary": 0.30, "effect_game": 0.4, "hours": 4,
+     "type": "pill", "category": "nagirt",
+     "effect_salary": 0.30, "effect_game": 0.4, "hours": 4,
      "side_effect_chance": 50, "fine_bonus": 0.25},
     {"id": "nagirt_extreme", "name": "💊💊💊 Нагирт Экстрим", "price": 12000,
      "description": "+50% к зарплате, +70% к играм на 6 часов. Риск штрафа +40%",
-     "type": "pill", "effect_salary": 0.50, "effect_game": 0.7, "hours": 6,
+     "type": "pill", "category": "nagirt",
+     "effect_salary": 0.50, "effect_game": 0.7, "hours": 6,
      "side_effect_chance": 75, "fine_bonus": 0.4},
     {"id": "antidote", "name": "💉 Антидот", "price": 2500,
-     "description": "Снимает побочки и сбрасывает толерантность", "type": "antidote"},
+     "description": "Снимает побочки и сбрасывает толерантность", "type": "antidote", "category": "misc"},
     {"id": "lottery_ticket", "name": "🎫 Лотерейный билет", "price": 1000,
-     "description": "Шанс выиграть до 10000₽!", "type": "lottery"},
+     "description": "Шанс выиграть до 10000₽!", "type": "lottery", "category": "misc"},
     {"id": "instant_salary", "name": "⏱️ Мгновенная получка", "price": 8000,
-     "description": "Сразу получаешь зарплату без ожидания", "type": "instant"},
+     "description": "Сразу получаешь зарплату без ожидания", "type": "instant", "category": "misc"},
 ]
 
 # ==================== БИЗНЕСЫ ====================
@@ -1352,7 +1409,16 @@ async def get_user(user_id: int) -> Optional[Dict[str, Any]]:
         user = await cursor.fetchone()
         return dict(user) if user else None
 
-async def register_user(user_id: int, username: str, full_name: str, referrer_id: Optional[int] = None):
+async def register_user(
+    user_id: int,
+    username: str,
+    full_name: str,
+    referrer_id: Optional[int] = None,
+) -> Tuple[bool, bool]:
+    """
+    Returns:
+        (created_new_player, referral_invite_record_created)
+    """
     async with aiosqlite.connect(DB_NAME) as db:
         cursor = await db.execute("SELECT 1 FROM players WHERE user_id = ?", (user_id,))
         exists = await cursor.fetchone()
@@ -1366,9 +1432,10 @@ async def register_user(user_id: int, username: str, full_name: str, referrer_id
                 (user_id, ECONOMY_SETTINGS["start_balance"])
             )
 
+            referral_record_created = False
             # Если регистрация пришла по рефералке — фиксируем связь.
             if referrer_id is not None and referrer_id != user_id:
-                await db.execute(
+                ref_cur = await db.execute(
                     """
                     INSERT INTO referral_invites (inviter_id, invitee_id, credited_at, milestone, reward_inviter, reward_newcomer)
                     VALUES (?, ?, NULL, 0, 0, 0)
@@ -1376,7 +1443,15 @@ async def register_user(user_id: int, username: str, full_name: str, referrer_id
                     """,
                     (referrer_id, user_id),
                 )
+                # При ON CONFLICT DO NOTHING rowcount обычно 1 или 0.
+                try:
+                    referral_record_created = (ref_cur.rowcount or 0) > 0
+                except Exception:
+                    referral_record_created = True
             await db.commit()
+            return True, referral_record_created
+
+        return False, False
 
 async def update_balance(user_id: int, amount: int, txn_type: str, description: str):
     """Безопасное обновление баланса – баланс никогда не уходит в минус."""
@@ -2356,6 +2431,30 @@ def get_shop_keyboard() -> InlineKeyboardMarkup:
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main"), InlineKeyboardButton(text="❌ Закрыть", callback_data="shop_close")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
+
+# ==================== МАГАЗИН: КАТЕГОРИИ ====================
+SHOP_CATEGORY_ORDER = ["boosts", "nagirt", "protection", "inventory", "special", "misc"]
+SHOP_CATEGORY_META = {
+    "boosts": "📈 Бусты",
+    "nagirt": "💊 Нагирт",
+    "protection": "🛡️ Защита",
+    "inventory": "📦 Инвентарь",
+    "special": "🎲 Особое",
+    "misc": "🎁 Разное",
+}
+
+
+def get_shop_categories_keyboard() -> InlineKeyboardMarkup:
+    buttons = []
+    for key in SHOP_CATEGORY_ORDER:
+        if any(item.get("category") == key for item in SHOP_ITEMS):
+            buttons.append([InlineKeyboardButton(text=SHOP_CATEGORY_META.get(key, key), callback_data=f"shop_cat_{key}")])
+    buttons.append([
+        InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main"),
+        InlineKeyboardButton(text="❌ Закрыть", callback_data="shop_close"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
 def get_minigames_keyboard() -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton(text="🎲 Кости (чёт / нечёт)", callback_data="game_dice")],
@@ -2445,6 +2544,7 @@ def get_items_for_checks() -> InlineKeyboardMarkup:
 class TransferStates(StatesGroup):
     choosing_recipient = State()
     entering_amount = State()
+    confirming = State()
 
 class BroadcastStates(StatesGroup):
     waiting_for_message = State()
@@ -2693,7 +2793,32 @@ async def cmd_start(message: Message):
     user_id = message.from_user.id
     username = message.from_user.username or "Без username"
     full_name = message.from_user.full_name
-    await register_user(user_id, username, full_name, referrer_id=referrer_id)
+    created_new_player, referral_record_created = await register_user(
+        user_id,
+        username,
+        full_name,
+        referrer_id=referrer_id,
+    )
+
+    # Уведомления при регистрации по реферальной ссылке.
+    if created_new_player and referral_record_created and referrer_id is not None:
+        inviter = await get_user(referrer_id)
+        inviter_name = (inviter or {}).get("full_name") or str(referrer_id)
+        try:
+            await bot.send_message(
+                referrer_id,
+                f"🎉 По вашей реферальной ссылке зарегистрировался новый пользователь: {full_name} (ID: {user_id})."
+            )
+        except Exception as e:
+            logger.error(f"Не удалось отправить уведомление пригласившему {referrer_id}: {e}")
+
+        try:
+            await message.answer(
+                f"🎁 Вы зарегистрировались по реферальной ссылке!\n"
+                f"Вам начислен стартовый капитал: {format_money(ECONOMY_SETTINGS['start_balance'])}"
+            )
+        except Exception:
+            pass
     user = await get_user(user_id)
     nagirt_effects = await get_active_nagirt_effects(user_id)
     tolerance = await get_nagirt_tolerance(user_id)
@@ -2939,15 +3064,81 @@ async def handle_shop(message: Message):
     if nagirt_effects["has_active"]:
         shop_text += f"💊 *Активные таблетки:* +{int(nagirt_effects['salary_boost']*100)}% к зарплате, +{int(nagirt_effects['game_boost']*100)}% к играм\n"
     shop_text += (
-        "\n*Категории товаров:*\n"
-        "• 📈 **Бусты** - увеличивают зарплату\n"
-        "• 💊 **Нагирт** - мощные усилители с высоким риском\n"
-        "• 🛡️ **Защита** - от штрафов и проверок\n"
-        "• 🎁 **Разное** - лотереи и экстренные опции\n\n"
-        "🎒 *Товары кладутся в инвентарь* — применяй оттуда.\n"
-        "⚠️ *Таблетки Нагирт имеют побочные эффекты и вызывают привыкание!*"
+        "\n*Выберите категорию товара:*"
+        "\n\n🎒 *Товары кладутся в инвентарь* — применяй оттуда."
     )
-    await message.answer(shop_text, parse_mode="Markdown", reply_markup=get_shop_keyboard())
+    await message.answer(shop_text, parse_mode="Markdown", reply_markup=get_shop_categories_keyboard())
+
+
+@dp.callback_query(F.data == "shop_back_categories")
+async def shop_back_categories(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    user = await get_user(user_id)
+    if not user:
+        await callback.answer("❌ Пользователь не найден", show_alert=True)
+        return
+    active_boosts = await get_active_boosts(user_id)
+    nagirt_effects = await get_active_nagirt_effects(user_id)
+    shop_text = (
+        "🏪 *Antonov-Shop*\n\n"
+        f"💰 *Ваш баланс:* {format_money(user['balance'])}\n\n"
+    )
+    if active_boosts > 0:
+        shop_text += f"📈 *Активные бусты:* +{int(active_boosts*100)}%\n"
+    if nagirt_effects["has_active"]:
+        shop_text += f"💊 *Активные таблетки:* +{int(nagirt_effects['salary_boost']*100)}% к зарплате, +{int(nagirt_effects['game_boost']*100)}% к играм\n"
+    shop_text += "\n*Выберите категорию товара:*"
+    try:
+        await callback.message.edit_text(shop_text, parse_mode="Markdown", reply_markup=get_shop_categories_keyboard())
+    except Exception:
+        await callback.message.answer(shop_text, parse_mode="Markdown", reply_markup=get_shop_categories_keyboard())
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("shop_cat_"))
+async def shop_cat(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    user = await get_user(user_id)
+    if not user:
+        await callback.answer("❌ Пользователь не найден", show_alert=True)
+        return
+    category_key = callback.data[len("shop_cat_"):]
+    category_title = SHOP_CATEGORY_META.get(category_key, category_key)
+    items = [i for i in SHOP_ITEMS if i.get("category") == category_key]
+    if not items:
+        await callback.answer("В этой категории пока нет товаров", show_alert=True)
+        return
+
+    mods = await get_player_modifiers(user_id)
+    social = await get_social_status_for_user(user_id)
+    discount = float(mods.get("shop_discount", 0.0)) + float(social.get("shop_discount_add", 0.0))
+    discount = max(0.0, min(0.85, discount))
+
+    shop_lines = [f"🏪 *Antonov-Shop*", f"📦 *Категория:* {category_title}", ""]
+    kb_buttons = []
+    for item in items:
+        base_price = int(item["price"])
+        if discount > 0:
+            final_price = max(1, int(round(base_price * (1.0 - discount))))
+            shop_lines.append(
+                f"{item['name']} — {format_money(base_price)}\n"
+                f"🏷 Скидка {int(discount*100)}% → {format_money(final_price)}\n"
+            )
+            kb_buttons.append([InlineKeyboardButton(text=f"{item['name']} - {format_money(final_price)}", callback_data=f"buy_{item['id']}")])
+        else:
+            shop_lines.append(f"{item['name']} - {format_money(base_price)}\n")
+            kb_buttons.append([InlineKeyboardButton(text=f"{item['name']} - {format_money(base_price)}", callback_data=f"buy_{item['id']}")])
+
+    kb_buttons.append([
+        InlineKeyboardButton(text="🔙 Назад в категории", callback_data="shop_back_categories"),
+        InlineKeyboardButton(text="❌ Закрыть", callback_data="shop_close"),
+    ])
+    shop_text = "\n".join(shop_lines).replace("\n\n\n", "\n\n")
+    try:
+        await callback.message.edit_text(shop_text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons))
+    except Exception:
+        await callback.message.answer(shop_text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons))
+    await callback.answer()
 
 @dp.callback_query(F.data.startswith("buy_"))
 async def handle_buy_item(callback: CallbackQuery):
@@ -4034,7 +4225,16 @@ async def duel_cancel_choose(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "cancel_transfer")
 async def handle_cancel_transfer(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.edit_text("❌ Перевод отменен")
+    try:
+        await callback.message.edit_text(
+            "❌ Перевод отменен.",
+            reply_markup=get_main_keyboard(callback.from_user.id),
+        )
+    except Exception:
+        await callback.message.answer(
+            "❌ Перевод отменен.",
+            reply_markup=get_main_keyboard(callback.from_user.id),
+        )
     await callback.answer()
 
 @dp.message(TransferStates.entering_amount)
@@ -4050,26 +4250,34 @@ async def handle_transfer_amount(message: Message, state: FSMContext):
         if amount < ECONOMY_SETTINGS["min_transfer"]:
             await message.answer(f"❌ Минимальная сумма перевода - {format_money(ECONOMY_SETTINGS['min_transfer'])}")
             return
+
         data = await state.get_data()
         recipient_id = data.get("recipient_id")
         if not recipient_id:
             await message.answer("❌ Ошибка: получатель не выбран")
             await state.clear()
             return
+
         recipient = await get_user(recipient_id)
         if not recipient:
             await message.answer("❌ Ошибка: получатель не найден")
             await state.clear()
             return
+
         ge = await get_global_economy()
         mods = await get_player_modifiers(user_id)
         social = await get_social_status_for_user(user_id)
-        rep_s = reputation_percent_from_row(sender)
-        fee_mult = 1.12 - 0.24 * (rep_s / 100.0)
-        base_fee = int(amount * ge["transfer_commission_pct"] * fee_mult)
-        kidala_extra = int(amount * float(mods.get("transfer_extra_fee", 0.0)))
-        comm_mult = float(social.get("transfer_commission_multiplier", 1.0))
-        fee = max(0, int((base_fee + kidala_extra) * comm_mult))
+
+        # Комиссия по ТЗ:
+        # - базовая: amount * transfer_commission_pct
+        # - "Легенда" => 0%
+        # - "Кидала" => +5% (у вас хранится в transfer_extra_fee)
+        if social.get("status_key") == "legend":
+            fee = 0
+        else:
+            fee_pct = float(ge.get("transfer_commission_pct", 0.0)) + float(mods.get("transfer_extra_fee", 0.0))
+            fee = max(0, int(round(amount * fee_pct)))
+
         total_debit = amount + fee
         if total_debit > sender["balance"]:
             await message.answer(
@@ -4078,55 +4286,126 @@ async def handle_transfer_amount(message: Message, state: FSMContext):
                 f"(перевод {format_money(amount)} + комиссия {format_money(fee)}).\n"
                 f"Твой баланс: {format_money(sender['balance'])}"
             )
+            await state.clear()
             return
-        await update_balance(
-            user_id,
-            -total_debit,
-            "transfer_out",
-            f"Перевод {recipient['full_name']} (−{amount}₽, комиссия {fee}₽)",
+
+        await state.update_data(
+            recipient_id=recipient_id,
+            amount=amount,
+            fee=fee,
+            total_debit=total_debit,
         )
-        await update_balance(
-            recipient_id,
-            amount,
-            "transfer_in",
-            f"Перевод от {sender['full_name']}",
-        )
-        sender_updated = await get_user(user_id)
-        recipient_updated = await get_user(recipient_id)
-        rep_kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(text=f"{s}⭐", callback_data=f"rep_tr_{user_id}_{s}")
-                    for s in (1, 2, 3, 4, 5)
-                ]
-            ]
-        )
+        await state.set_state(TransferStates.confirming)
+
+        fee_base_pct = int(float(ge.get("transfer_commission_pct", 0.0)) * 100)
+        kidala_extra_pct = float(mods.get("transfer_extra_fee", 0.0))
+        if social.get("status_key") == "legend":
+            fee_note = " (Легенда — 0%)"
+        elif kidala_extra_pct > 0:
+            fee_note = f" (база {fee_base_pct}% + Кидала {int(round(kidala_extra_pct * 100))}%)"
+        else:
+            fee_note = f" (база {fee_base_pct}%)"
+
         await message.answer(
-            f"✅ *Перевод выполнен*\n\n"
-            f"📤 Получатель получит: {format_money(amount)}\n"
-            f"💸 Комиссия Виталика: {format_money(fee)}\n"
-            f"💰 Списано с тебя: {format_money(total_debit)}\n"
-            f"💳 Твой баланс: {format_money(sender_updated['balance'])}\n\n"
-            f"_Репутация снижает комиссию; ачивка «Кидала» добавляет доп. сбор._",
+            "📤 *ПОДТВЕРЖДЕНИЕ ПЕРЕВОДА*\n\n"
+            f"👤 Получатель: {recipient['full_name']}\n"
+            f"💰 Сумма перевода: {format_money(amount)}\n"
+            f"💸 Комиссия: {format_money(fee)}{fee_note}\n"
+            f"📦 Итого к списанию: {format_money(total_debit)}\n\n"
+            "Подтвердите операцию:",
             parse_mode="Markdown",
-            reply_markup=get_main_keyboard(user_id),
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="✅ Подтвердить", callback_data="confirm_transfer")],
+                    [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_transfer")],
+                ]
+            ),
         )
-        try:
-            await bot.send_message(
-                recipient_id,
-                f"💰 *Перевод*\n\n"
-                f"📥 Получено: {format_money(amount)}\n"
-                f"👤 От: {sender['full_name']}\n"
-                f"💳 Баланс: {format_money(recipient_updated['balance'])}\n\n"
-                f"Оцени надёжность отправителя (1–5):",
-                parse_mode="Markdown",
-                reply_markup=rep_kb,
-            )
-        except Exception:
-            pass
     except ValueError:
         await message.answer("❌ Пожалуйста, введите число!")
         return
+
+
+@dp.callback_query(F.data == "confirm_transfer", TransferStates.confirming)
+async def confirm_transfer(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    data = await state.get_data()
+    recipient_id = data.get("recipient_id")
+    amount = data.get("amount")
+    fee = data.get("fee")
+    total_debit = data.get("total_debit")
+
+    if not recipient_id or amount is None or fee is None or total_debit is None:
+        await callback.answer("❌ Ошибка подтверждения, повторите перевод.", show_alert=True)
+        await state.clear()
+        return
+
+    sender = await get_user(user_id)
+    recipient = await get_user(int(recipient_id))
+    if not sender or not recipient:
+        await callback.answer("❌ Ошибка данных, повторите перевод.", show_alert=True)
+        await state.clear()
+        return
+    if int(total_debit) > int(sender["balance"]):
+        await callback.answer("❌ Недостаточно средств.", show_alert=True)
+        await state.clear()
+        return
+
+    await update_balance(
+        user_id,
+        -int(amount),
+        "transfer_out",
+        f"Перевод {recipient['full_name']} (−{int(amount)}₽)",
+    )
+    if int(fee) > 0:
+        await update_balance(
+            user_id,
+            -int(fee),
+            "transfer_fee",
+            f"Комиссия перевода (−{int(fee)}₽) → {recipient['full_name']}",
+        )
+    await update_balance(
+        int(recipient_id),
+        int(amount),
+        "transfer_in",
+        f"Перевод от {sender['full_name']}",
+    )
+
+    sender_updated = await get_user(user_id)
+    recipient_updated = await get_user(int(recipient_id))
+    rep_kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=f"{s}⭐", callback_data=f"rep_tr_{user_id}_{s}")
+                for s in (1, 2, 3, 4, 5)
+            ]
+        ]
+    )
+
+    await callback.message.edit_text(
+        f"✅ *Перевод выполнен*\n\n"
+        f"📤 Получатель получит: {format_money(int(amount))}\n"
+        f"💸 Комиссия: {format_money(int(fee))}\n"
+        f"💰 Списано с тебя: {format_money(int(total_debit))}\n"
+        f"💳 Твой баланс: {format_money(sender_updated['balance'])}\n",
+        parse_mode="Markdown",
+        reply_markup=get_main_keyboard(user_id),
+    )
+
+    try:
+        await bot.send_message(
+            int(recipient_id),
+            f"💰 *Перевод*\n\n"
+            f"📥 Получено: {format_money(int(amount))}\n"
+            f"👤 От: {sender['full_name']}\n"
+            f"💳 Баланс: {format_money(recipient_updated['balance'])}\n\n"
+            f"Оцени надёжность отправителя (1–5):",
+            parse_mode="Markdown",
+            reply_markup=rep_kb,
+        )
+    except Exception:
+        pass
+
     await state.clear()
 
 
@@ -6199,6 +6478,18 @@ async def referral_credit_scheduler_immediate():
                     "referral_newcomer",
                     "Реферальный бонус (новичок)",
                 )
+
+                # Уведомление новичка о начислении бонуса.
+                if newcomer_reward > 0:
+                    try:
+                        await bot.send_message(
+                            invitee_id,
+                            f"🎁 Реферальный бонус!\n"
+                            f"Вы выполнили условия (минимум {REFERRAL_ACTIONS_MIN} действий).\n"
+                            f"Начислено: +{format_money(newcomer_reward)}."
+                        )
+                    except Exception as e:
+                        logger.error(f"Не удалось отправить бонус новичку {invitee_id}: {e}")
 
                 # Дополнительные награды по ТЗ.
                 if after_credited == 3 and inviter_reward > 0:
