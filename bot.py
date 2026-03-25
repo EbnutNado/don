@@ -215,13 +215,13 @@ BUSINESS_NOTIFICATION_COOLDOWN = 3000  # 50 минут в секундах (чт
 ECONOMY_SETTINGS = {
     "start_balance": 5000,
     # Зарплата: чуть реалистичнее разброс и реже, но крупнее базовая вилка
-    "salary_min": 1100,
-    "salary_max": 4800,
-    "salary_interval": 360,
+    "salary_min": 3000,
+    "salary_max": 8000,
+    "salary_interval": 300,
     "fine_chance": 0.40,
     "random_fine_min": 450,
     "random_fine_max": 3200,
-    "asphalt_earnings": 45,
+    "asphalt_earnings": 150,
     "asphalt_fine_min": 180,
     "asphalt_fine_max": 750,
     # Кости: чёт / нечёт (кубик 1–6, угадал → ×2)
@@ -238,15 +238,15 @@ ECONOMY_SETTINGS = {
     "duel_max_bet": 10000,
     "duel_dice_sides": 6,
     # Топ заработка за вчера (МСК), выплата ежедневно в 10:00
-    "daily_top_reward_1": 35000,
-    "daily_top_reward_2": 20000,
-    "daily_top_reward_3": 12000,
+    "daily_top_reward_1": 50000,
+    "daily_top_reward_2": 30000,
+    "daily_top_reward_3": 15000,
     "inventory_base_slots": 20,
 }
 
 # ==================== МЕХАНИКИ БИЗНЕСОВ ====================
 # Цены на покупку бизнесов снизить примерно в 1.5 раза.
-BUSINESS_PRICE_DIVISOR: float = 1.5
+BUSINESS_PRICE_DIVISOR: float = 2.0
 
 # ==================== СОЦИАЛЬНЫЕ / РЕФЕРАЛЬНЫЕ СИСТЕМЫ ====================
 REFERRAL_ACTIONS_MIN: int = 3  # "активный новичок" (облегчённый порог)
@@ -269,7 +269,7 @@ BANK_SETTINGS = {
     "name": "Асфальт-Капитал",
     "min_loan": 2_000,
     "max_loan": 200_000,
-    "hourly_interest_rate": 0.004,  # 0.4% в час
+    "hourly_interest_rate": 0.008,  # 0.4% в час
     "term_hours": 48,  # после срока — режим коллекторов
     # За начислениями следим раз в час.
     "accrual_interval_sec": 3600,
@@ -282,7 +282,7 @@ BANK_SETTINGS = {
     # Казна всегда полна (логически). Начальный "пул" оставляем под 10 000 000.
     "initial_pool_liquidity": int(os.getenv("BANK_INITIAL_POOL", "10000000")),
     "min_deposit": 5_000,
-    "deposit_hourly_rate": 0.002,  # 0.2% в час
+    "deposit_hourly_rate": 0.004,  # 0.2% в час
     "deposit_interest_interval_sec": 3600,
 }
 
@@ -331,7 +331,7 @@ BUSINESS_TYPES = {
         "name": "🪑 Офисное кресло",
         "description": "Мягкое, с подлокотниками. Начальник оценит.",
         "price": 3000,
-        "base_income": 30,
+        "base_income": 60,
         "salary_bonus": 0.01,
         "duel_bonus": 0.0,
         "asphalt_bonus": 0.0,
@@ -346,7 +346,7 @@ BUSINESS_TYPES = {
         "name": "💻 Игровой ПК",
         "description": "RTX 5090, Intel i9. Для работы, конечно.",
         "price": 10000,
-        "base_income": 150,
+        "base_income": 300,
         "salary_bonus": 0.02,
         "duel_bonus": 0.0,
         "asphalt_bonus": 0.0,
@@ -363,7 +363,7 @@ BUSINESS_TYPES = {
         "name": "☕ Вендинговый аппарат",
         "description": "Кофе, снэки, доширак. Весь офис твой должник.",
         "price": 25000,
-        "base_income": 400,
+        "base_income": 800,
         "salary_bonus": 0.03,
         "duel_bonus": 0.0,
         "asphalt_bonus": 0.0,
@@ -379,7 +379,7 @@ BUSINESS_TYPES = {
         "name": "🏪 Ларёк у дома",
         "description": "Пиво, семечки, сим-карты. Торгуй, пока Виталик не пришёл.",
         "price": 60000,
-        "base_income": 1200,
+        "base_income": 2400,
         "salary_bonus": 0.05,
         "duel_bonus": 0.0,
         "asphalt_bonus": 0.0,
@@ -396,7 +396,7 @@ BUSINESS_TYPES = {
         "name": "🚛 Грузовой транспорт",
         "description": "Газель, рефрижератор, права с открытой категорией.",
         "price": 120000,
-        "base_income": 2500,
+        "base_income": 5000,
         "salary_bonus": 0.07,
         "duel_bonus": 0.0,
         "asphalt_bonus": 0.10,
@@ -413,7 +413,7 @@ BUSINESS_TYPES = {
         "name": "🏭 Мини-завод",
         "description": "Штампуй детали, печатай деньги.",
         "price": 300000,
-        "base_income": 6000,
+        "base_income": 12000,
         "salary_bonus": 0.10,
         "duel_bonus": 0.0,
         "asphalt_bonus": 0.0,
@@ -431,7 +431,7 @@ BUSINESS_TYPES = {
         "name": "🏢 Бизнес-центр",
         "description": "Сдавай этажи, собирай аренду. Вершина карьеры.",
         "price": 1000000,
-        "base_income": 20000,
+        "base_income": 40000,
         "salary_bonus": 0.15,
         "duel_bonus": 0.0,
         "asphalt_bonus": 0.05,
@@ -451,7 +451,7 @@ BUSINESS_TYPES = {
         "name": "₿ Майнинг-ферма в гараже",
         "description": "Видеокарты жрут свет, Виталик жрёт налоги. Классика.",
         "price": 450000,
-        "base_income": 8500,
+        "base_income": 1700,
         "salary_bonus": 0.08,
         "duel_bonus": 0.0,
         "asphalt_bonus": 0.0,
@@ -468,7 +468,7 @@ BUSINESS_TYPES = {
         "name": "🚕 Такси-парк",
         "description": "Жёлтые шашечки, чёрная бухгалтерия.",
         "price": 85000,
-        "base_income": 1600,
+        "base_income": 3200,
         "salary_bonus": 0.055,
         "duel_bonus": 0.0,
         "asphalt_bonus": 0.12,
@@ -484,7 +484,7 @@ BUSINESS_TYPES = {
         "name": "🚿 Автомойка самообслуживания",
         "description": "Пена, вода, кэш. Легальнее некуда.",
         "price": 180000,
-        "base_income": 3200,
+        "base_income": 6400,
         "salary_bonus": 0.06,
         "duel_bonus": 0.0,
         "asphalt_bonus": 0.05,
@@ -500,7 +500,7 @@ BUSINESS_TYPES = {
         "name": "🕶 Ларёк «с серой зоны»",
         "description": "Никто ничего не видел. Особенно налоговая.",
         "price": 220000,
-        "base_income": 4500,
+        "base_income": 9000,
         "salary_bonus": 0.04,
         "duel_bonus": 0.0,
         "asphalt_bonus": 0.0,
